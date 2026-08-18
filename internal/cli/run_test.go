@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/miclle/say/internal/player"
 	"github.com/miclle/say/internal/tts"
@@ -145,6 +146,118 @@ func TestRunPassesEdgeOptionsAndUsesMP3Tracks(t *testing.T) {
 	}
 }
 
+func TestRunUsesTUISelectedProviderWhenFlagIsOmitted(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "hello")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	synthesizer.extension = ".mp3"
+	transport := newFakeAudio(&stdout, synthesizer)
+	deps := testDependencies(synthesizer, transport)
+	deps.supportsTerminal = func(any) bool { return true }
+	selectionCalls := 0
+	deps.selectProvider = func(context.Context, io.Reader, io.Writer) (tts.Provider, error) {
+		selectionCalls++
+		return tts.ProviderEdge, nil
+	}
+	rawCalls, restoreCalls := 0, 0
+	deps.beginRaw = func(io.Reader) (func() error, error) {
+		rawCalls++
+		return func() error {
+			restoreCalls++
+			return nil
+		}, nil
+	}
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", "--speed", "1.25", path}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	if selectionCalls != 1 {
+		t.Fatalf("provider selector calls = %d, want 1", selectionCalls)
+	}
+	if got, want := synthesizer.options, (tts.Options{Provider: tts.ProviderEdge, Speed: 1.25}); got != want {
+		t.Fatalf("synthesizer options = %#v, want %#v", got, want)
+	}
+	if len(synthesizer.paths) != 1 || filepath.Ext(synthesizer.paths[0]) != ".mp3" {
+		t.Fatalf("synthesized paths = %#v, want one MP3 path", synthesizer.paths)
+	}
+	if rawCalls != 2 || restoreCalls != 2 {
+		t.Fatalf("raw/restore calls = %d/%d, want selector and playback restoration", rawCalls, restoreCalls)
+	}
+}
+
+func TestTTSProviderSelectorFitsStandardTerminalWidth(t *testing.T) {
+	var output bytes.Buffer
+	selected, err := selectTTSProvider(context.Background(), bytes.NewBufferString("\x1b[B\r"), &output)
+	if err != nil {
+		t.Fatalf("selectTTSProvider() error = %v", err)
+	}
+	if selected != tts.ProviderEdge {
+		t.Fatalf("selectTTSProvider() = %q, want %q", selected, tts.ProviderEdge)
+	}
+
+	frames := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\r\x1b[2K")
+	for index, frame := range frames {
+		if columns := utf8.RuneCountInString(frame); columns > 80 {
+			t.Fatalf("selection frame %d uses %d columns, want at most 80: %q", index+1, columns, frame)
+		}
+	}
+}
+
+func TestRunExplicitProviderSkipsTUISelection(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "hello")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	synthesizer.extension = ".mp3"
+	transport := newFakeAudio(&stdout, synthesizer)
+	deps := testDependencies(synthesizer, transport)
+	deps.supportsTerminal = func(any) bool { return true }
+	deps.selectProvider = func(context.Context, io.Reader, io.Writer) (tts.Provider, error) {
+		t.Fatal("provider selector called for explicit --provider")
+		return "", nil
+	}
+	deps.beginRaw = func(io.Reader) (func() error, error) {
+		return func() error { return nil }, nil
+	}
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", "--provider", "edge", path}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	if synthesizer.options.Provider != tts.ProviderEdge {
+		t.Fatalf("synthesizer provider = %q, want edge", synthesizer.options.Provider)
+	}
+}
+
+func TestRunRestoresTerminalWhenProviderSelectionIsCanceled(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "hello")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	deps := testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer))
+	deps.supportsTerminal = func(any) bool { return true }
+	deps.selectProvider = func(context.Context, io.Reader, io.Writer) (tts.Provider, error) {
+		return "", context.Canceled
+	}
+	restored := false
+	deps.beginRaw = func(io.Reader) (func() error, error) {
+		return func() error {
+			restored = true
+			return nil
+		}, nil
+	}
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", path}, &stdout, &stderr, deps)
+	if code != 130 || !strings.Contains(stderr.String(), "provider selection interrupted") {
+		t.Fatalf("runWithDependencies() = %d, stderr = %q; want interrupted selection", code, stderr.String())
+	}
+	if !restored {
+		t.Fatal("terminal was not restored after provider selection cancellation")
+	}
+	if synthesizer.options != (tts.Options{}) {
+		t.Fatalf("synthesizer initialized after canceled selection: %#v", synthesizer.options)
+	}
+}
+
 func TestRunRejectsProviderSpecificFlagConflicts(t *testing.T) {
 	path := writeDocument(t, "lesson.txt", "hello")
 	for _, tt := range []struct {
@@ -257,6 +370,9 @@ func TestRunCancellationStopsPreparationBeforeCleanupAndRestoresTerminal(t *test
 			return 20 * time.Second, nil
 		},
 		supportsTerminal: func(any) bool { return true },
+		selectProvider: func(context.Context, io.Reader, io.Writer) (tts.Provider, error) {
+			return tts.ProviderSystem, nil
+		},
 		beginRaw: func(io.Reader) (func() error, error) {
 			return func() error {
 				restored = true
@@ -328,6 +444,18 @@ func TestRunRejectsUsageAndDocumentErrors(t *testing.T) {
 	}
 }
 
+func TestRunHelpDescribesInteractiveProviderSelection(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	code := runWithDependencies(context.Background(), []string{"--help"}, &stdout, &stderr, testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer)))
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "interactive: choose; non-interactive: system") || strings.Contains(stderr.String(), `provider string\n\tTTS provider: system or edge (default "system")`) {
+		t.Fatalf("help output = %q, want interactive provider-selection guidance", stderr.String())
+	}
+}
+
 func TestRunReturns130WhenAlreadyCanceled(t *testing.T) {
 	path := writeDocument(t, "lesson.txt", "hello.")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -351,6 +479,9 @@ func testDependencies(synthesizer *fakeSynthesizer, transport *fakeAudio) depend
 		newTransport:     func() (audioTransport, error) { return transport, nil },
 		readDuration:     func(string) (time.Duration, error) { return 20 * time.Second, nil },
 		supportsTerminal: func(any) bool { return false },
+		selectProvider: func(context.Context, io.Reader, io.Writer) (tts.Provider, error) {
+			return tts.ProviderSystem, nil
+		},
 		beginRaw: func(io.Reader) (func() error, error) {
 			return nil, fmt.Errorf("must not enable raw input")
 		},

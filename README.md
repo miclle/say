@@ -1,6 +1,6 @@
 # say
 
-`say` 是一个用 Go 编写的 macOS 文档朗读终端程序。它读取本地 UTF-8 文本文档，按自然大段落和 TTS 单次调用上限组织内容。第一段音频就绪后立即显示并播放，后续段落按顺序在后台合成。播放过程中可以暂停，也可以按时间前后跳转。默认使用 macOS 系统 TTS，也可以选择实验性的 Microsoft Edge TTS。
+`say` 是一个用 Go 编写的 macOS 文档朗读终端程序。它读取本地 UTF-8 文本文档，按自然大段落和 TTS 单次调用上限组织内容。第一段音频就绪后立即显示并播放，后续段落按顺序在后台合成。播放过程中可以暂停，也可以按时间前后跳转。交互式启动时可以在 TUI 中选择 macOS 系统 TTS 或实验性的 Microsoft Edge TTS。
 
 ```text
 say  lesson.txt
@@ -21,8 +21,9 @@ Space 播放/暂停 · ← 回退 5s · → 快进 5s
 ## 功能
 
 - 打开任意本地 UTF-8 纯文本文档；`.txt`、`.md` 等扩展名均可。
-- 默认调用 macOS `/usr/bin/say`，使用“系统设置”中选择的声音和语速；每个自然段或限长片段会独立合成为临时 AIFF 音频。
-- 可通过 `--provider edge` 使用实验性的 Microsoft Edge Read Aloud 在线服务，合成 MP3 音频；默认声音为 `zh-CN-XiaoxiaoNeural`。
+- 交互式终端中如果没有传 `--provider`，会先显示 TTS provider 选择器；按上下方向键切换，按 Enter 确认。
+- 选择 `system` 时调用 macOS `/usr/bin/say`，使用“系统设置”中选择的声音和语速；每个自然段或限长片段会独立合成为临时 AIFF 音频。
+- 选择 `edge` 时使用实验性的 Microsoft Edge Read Aloud 在线服务并合成 MP3 音频；默认声音为 `zh-CN-XiaoxiaoNeural`。
 - 优先按空行识别自然大段落，同一段落中的多个句子会连续播放，单换行会规范为空格。
 - 只有自然段超过单次调用上限时，才按完整句子贪心组合为尽可能大的片段；超长单句再从逗号、分号、冒号、空格等位置切分。
 - 默认保证每次 TTS 调用不超过 500 个 Unicode 字符，可按服务限制调整。
@@ -34,7 +35,7 @@ Space 播放/暂停 · ← 回退 5s · → 快进 5s
 
 ## 使用
 
-要求 Go 1.26 或更高版本、macOS，以及启用 CGO 的 Go 工具链。构建时需要系统 Clang；播放使用 AVFoundation，不需要安装第三方播放器。默认 provider 还会调用 macOS 自带的 `/usr/bin/say`；Edge provider 需要访问 Microsoft 在线服务。
+要求 Go 1.26 或更高版本、macOS，以及启用 CGO 的 Go 工具链。构建时需要系统 Clang；播放使用 AVFoundation，不需要安装第三方播放器。System provider 会调用 macOS 自带的 `/usr/bin/say`；Edge provider 需要访问 Microsoft 在线服务。
 
 在项目目录中直接运行：
 
@@ -51,6 +52,14 @@ say ./notes.md
 
 安装后的命令名与 macOS 自带的 `/usr/bin/say` 相同，但本项目始终通过绝对路径调用系统程序，不会递归调用自身。
 
+当 stdin 和 stdout 都连接到终端、且没有显式传入 `--provider` 时，会显示单行选择器：
+
+```text
+TTS provider  › macOS system TTS  (↑/↓ choose · Enter confirm)
+```
+
+按 `↑`/`↓` 选择 provider，按 Enter 确认，按 `Ctrl-C` 取消。`--provider system` 或 `--provider edge` 会跳过选择器；输入或输出被重定向时不会显示选择器，并继续默认使用 `system`，以保持脚本行为稳定。
+
 ### 参数
 
 ```text
@@ -61,7 +70,7 @@ Usage: say [flags] <document>
   -no-color
         disable ANSI terminal colors
   -provider string
-        TTS provider: system or edge (default "system")
+        TTS provider: system or edge (interactive: choose; non-interactive: system)
   -rate int
         system speech rate in words per minute (default: system rate)
   -speed float

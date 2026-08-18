@@ -26,6 +26,7 @@ type transportFactory func() (audioTransport, error)
 type durationReader func(path string) (time.Duration, error)
 type terminalDetector func(value any) bool
 type rawInputFactory func(input io.Reader) (restore func() error, err error)
+type providerSelector func(ctx context.Context, input io.Reader, output io.Writer) (tts.Provider, error)
 
 type audioTransport interface {
 	player.Transport
@@ -39,6 +40,7 @@ type dependencies struct {
 	readDuration     durationReader
 	supportsTerminal terminalDetector
 	beginRaw         rawInputFactory
+	selectProvider   providerSelector
 }
 
 // Run executes the say command and returns a process exit code.
@@ -58,6 +60,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			}
 			return terminal.BeginRawInput(file)
 		},
+		selectProvider: selectTTSProvider,
 	})
 }
 
@@ -69,7 +72,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 
 	flags := flag.NewFlagSet("say", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	provider := flags.String("provider", string(tts.ProviderSystem), "TTS provider: system or edge")
+	provider := flags.String("provider", "", "TTS provider: system or edge (interactive: choose; non-interactive: system)")
 	voice := flags.String("voice", "", "provider voice name (default: provider voice)")
 	rate := flags.Int("rate", 0, "system speech rate in words per minute (default: system rate)")
 	speed := flags.Float64("speed", 1, "Edge TTS speed multiplier, from 0.5 to 2.0")
@@ -102,27 +105,21 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		fmt.Fprintln(stderr, "say: rate must not be negative")
 		return 2
 	}
-	selectedProvider := tts.Provider(*provider)
-	if selectedProvider != tts.ProviderSystem && selectedProvider != tts.ProviderEdge {
-		fmt.Fprintln(stderr, `say: provider must be "system" or "edge"`)
-		return 2
-	}
-	if selectedProvider == tts.ProviderEdge && explicit["rate"] {
-		fmt.Fprintln(stderr, "say: rate is only supported by the system provider")
-		return 2
-	}
-	if selectedProvider == tts.ProviderSystem && explicit["speed"] {
-		fmt.Fprintln(stderr, "say: speed is only supported by the edge provider")
-		return 2
-	}
-	if selectedProvider == tts.ProviderEdge && (math.IsNaN(*speed) || math.IsInf(*speed, 0) || *speed < 0.5 || *speed > 2) {
-		fmt.Fprintln(stderr, "say: speed must be between 0.5 and 2.0")
-		return 2
-	}
 	if flags.NArg() != 1 {
 		fmt.Fprintln(stderr, "say: exactly one document path is required")
 		flags.Usage()
 		return 2
+	}
+	interactive := deps.supportsTerminal(deps.input) && deps.supportsTerminal(stdout)
+	selectedProvider := tts.ProviderSystem
+	if explicit["provider"] {
+		selectedProvider = tts.Provider(*provider)
+	}
+	if explicit["provider"] || !interactive {
+		if err := validateProviderFlags(selectedProvider, *rate, *speed, explicit); err != nil {
+			fmt.Fprintf(stderr, "say: %v\n", err)
+			return 2
+		}
 	}
 
 	title, text, err := document.Read(flags.Arg(0))
@@ -134,6 +131,31 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	if err != nil {
 		fmt.Fprintf(stderr, "say: split document: %v\n", err)
 		return 1
+	}
+	if !explicit["provider"] && interactive {
+		restoreSelection, err := deps.beginRaw(deps.input)
+		if err != nil {
+			fmt.Fprintf(stderr, "say: enable provider selection: %v\n", err)
+			return 1
+		}
+		selectedProvider, err = deps.selectProvider(ctx, deps.input, stdout)
+		restoreErr := restoreSelection()
+		if restoreErr != nil {
+			fmt.Fprintf(stderr, "say: restore terminal after provider selection: %v\n", restoreErr)
+			return 1
+		}
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				fmt.Fprintf(stderr, "say: provider selection interrupted: %v\n", err)
+				return 130
+			}
+			fmt.Fprintf(stderr, "say: select TTS provider: %v\n", err)
+			return 1
+		}
+		if err := validateProviderFlags(selectedProvider, *rate, *speed, explicit); err != nil {
+			fmt.Fprintf(stderr, "say: %v\n", err)
+			return 2
+		}
 	}
 	options := tts.Options{Provider: selectedProvider, Voice: *voice}
 	if selectedProvider == tts.ProviderSystem {
@@ -147,7 +169,6 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		return 1
 	}
 
-	interactive := deps.supportsTerminal(deps.input) && deps.supportsTerminal(stdout)
 	view := terminal.New(stdout, !*noColor && deps.supportsTerminal(stdout), title, synthesizer.Name())
 	view.SetControls(interactive)
 	if err := view.Preparing(len(chunks)); err != nil {
@@ -203,6 +224,34 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		return 1
 	}
 	return 0
+}
+
+func validateProviderFlags(provider tts.Provider, rate int, speed float64, explicit map[string]bool) error {
+	if provider != tts.ProviderSystem && provider != tts.ProviderEdge {
+		return fmt.Errorf(`provider must be "system" or "edge"`)
+	}
+	if provider == tts.ProviderEdge && explicit["rate"] {
+		return fmt.Errorf("rate is only supported by the system provider")
+	}
+	if provider == tts.ProviderSystem && explicit["speed"] {
+		return fmt.Errorf("speed is only supported by the edge provider")
+	}
+	if provider == tts.ProviderEdge && (math.IsNaN(speed) || math.IsInf(speed, 0) || speed < 0.5 || speed > 2) {
+		return fmt.Errorf("speed must be between 0.5 and 2.0")
+	}
+	return nil
+}
+
+func selectTTSProvider(ctx context.Context, input io.Reader, output io.Writer) (tts.Provider, error) {
+	providers := []tts.Provider{tts.ProviderSystem, tts.ProviderEdge}
+	selected, err := terminal.Select(ctx, input, output, "TTS provider", []string{
+		"macOS system TTS",
+		"Edge TTS (experimental · online)",
+	})
+	if err != nil {
+		return "", err
+	}
+	return providers[selected], nil
 }
 
 func prepareTracks(
