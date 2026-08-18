@@ -7,12 +7,23 @@ import (
 	"unicode/utf8"
 )
 
-func TestSplitKeepsNaturalSentences(t *testing.T) {
-	got, err := Split("  你好世界。“现在开始！”  Go   is fun.\n最后一行  ", 50)
+func TestSplitKeepsNaturalParagraphs(t *testing.T) {
+	got, err := Split("第一句。第二句。\n这一行仍属于同一自然段。\n\n  \n第三句。第四句。", 100)
 	if err != nil {
 		t.Fatalf("Split() error = %v", err)
 	}
-	want := []string{"你好世界。", "“现在开始！”", "Go is fun.", "最后一行"}
+	want := []string{"第一句。第二句。 这一行仍属于同一自然段。", "第三句。第四句。"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Split() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSplitPacksSentencesWithinParagraphLimit(t *testing.T) {
+	got, err := Split("第一句。第二句。第三句。第四句。", 9)
+	if err != nil {
+		t.Fatalf("Split() error = %v", err)
+	}
+	want := []string{"第一句。 第二句。", "第三句。 第四句。"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Split() = %#v, want %#v", got, want)
 	}
@@ -41,18 +52,18 @@ func TestSplitOversizedSentenceAtWhitespace(t *testing.T) {
 }
 
 func TestSplitHandlesEnglishAndUnicodeEllipses(t *testing.T) {
-	got, err := Split("Wait... Next. 再等等……然后出发。", 50)
+	got, err := Split("Wait... Next. 再等等……然后出发。", 16)
 	if err != nil {
 		t.Fatalf("Split() error = %v", err)
 	}
-	want := []string{"Wait...", "Next.", "再等等……", "然后出发。"}
+	want := []string{"Wait... Next.", "再等等…… 然后出发。"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Split() = %#v, want %#v", got, want)
 	}
 }
 
 func TestSplitDoesNotBreakCommonAbbreviationsOrInitials(t *testing.T) {
-	got, err := Split("Dr. Smith met J. R. Tolkien. They talked.", 80)
+	got, err := Split("Dr. Smith met J. R. Tolkien. They talked.", 28)
 	if err != nil {
 		t.Fatalf("Split() error = %v", err)
 	}
@@ -63,22 +74,22 @@ func TestSplitDoesNotBreakCommonAbbreviationsOrInitials(t *testing.T) {
 }
 
 func TestSplitDistinguishesInitialismsFromSentenceEndingLetters(t *testing.T) {
-	got, err := Split("U.S. Navy arrived. Option A. Next.", 80)
+	got, err := Split("U.S. Navy arrived. Option A. Next.", 18)
 	if err != nil {
 		t.Fatalf("Split() error = %v", err)
 	}
-	want := []string{"U.S. Navy arrived.", "Option A.", "Next."}
+	want := []string{"U.S. Navy arrived.", "Option A. Next."}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Split() = %#v, want %#v", got, want)
 	}
 }
 
-func TestSplitKeepsNumberedMarkdownMarkersWithTheirLines(t *testing.T) {
-	got, err := Split("1. First item.\n2. Second item.", 80)
+func TestSplitKeepsNumberedMarkdownMarkersWithTheirTextWhenParagraphIsOversized(t *testing.T) {
+	got, err := Split("1. First item has several words.\n2. Second item.", 20)
 	if err != nil {
 		t.Fatalf("Split() error = %v", err)
 	}
-	want := []string{"1. First item.", "2. Second item."}
+	want := []string{"1. First item has", "several words.", "2. Second item."}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Split() = %#v, want %#v", got, want)
 	}

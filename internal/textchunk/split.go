@@ -16,10 +16,70 @@ func Split(text string, maxRunes int) ([]string, error) {
 	}
 
 	var chunks []string
-	for _, sentence := range sentences(text) {
-		chunks = append(chunks, limit(sentence, maxRunes)...)
+	for _, paragraph := range paragraphs(text) {
+		chunks = append(chunks, splitParagraph(paragraph, maxRunes)...)
 	}
 	return chunks, nil
+}
+
+func paragraphs(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	lines := strings.Split(text, "\n")
+	var result []string
+	var current []string
+
+	flush := func() {
+		if len(current) > 0 {
+			result = append(result, strings.Join(current, "\n"))
+		}
+		current = current[:0]
+	}
+
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			flush()
+			continue
+		}
+		current = append(current, line)
+	}
+	flush()
+	return result
+}
+
+func splitParagraph(paragraph string, maxRunes int) []string {
+	normalized := normalize(paragraph)
+	if len([]rune(normalized)) <= maxRunes {
+		return []string{normalized}
+	}
+
+	var pieces []string
+	for _, sentence := range sentences(paragraph) {
+		pieces = append(pieces, limit(sentence, maxRunes)...)
+	}
+	return pack(pieces, maxRunes)
+}
+
+func pack(pieces []string, maxRunes int) []string {
+	var chunks []string
+	current := ""
+	for _, piece := range pieces {
+		if current == "" {
+			current = piece
+			continue
+		}
+		candidate := current + " " + piece
+		if len([]rune(candidate)) <= maxRunes {
+			current = candidate
+			continue
+		}
+		chunks = append(chunks, current)
+		current = piece
+	}
+	if current != "" {
+		chunks = append(chunks, current)
+	}
+	return chunks
 }
 
 func sentences(text string) []string {

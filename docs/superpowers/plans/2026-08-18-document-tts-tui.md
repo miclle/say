@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a Go command that opens a UTF-8 text document, splits it within a configurable TTS request limit, prints each sentence in a terminal UI, and plays it with the operating system TTS.
+**Goal:** Build a Go command that opens a UTF-8 text document, keeps natural paragraphs together within a configurable TTS request limit, prints each paragraph-sized unit in a terminal UI, and plays it with the operating system TTS.
 
 **Architecture:** Keep the speech engine behind a small `tts.Speaker` interface. The CLI reads and validates a document, `textchunk.Split` creates ordered rune-safe speech units, and `player.Play` emits each unit to a terminal renderer immediately before a blocking speech call, which guarantees text/audio ordering without buffering the entire audio stream.
 
@@ -20,7 +20,7 @@
 
 ---
 
-### Task 1: Go module, document reader, and sentence-limited chunker
+### Task 1: Go module, document reader, and paragraph-first bounded chunker
 
 **Files:**
 - Create: `go.mod`
@@ -62,11 +62,11 @@
 
 - [x] **Step 5: Write failing chunker tests**
 
-  Use literal expectations for Chinese and English sentence punctuation, long sentences split at soft punctuation or whitespace, emoji/rune safety, whitespace normalization, invalid limits, and the invariant `utf8.RuneCountInString(chunk) <= maxRunes`. For example:
+  Use literal expectations for blank-line paragraph boundaries, greedy sentence packing inside oversized paragraphs, long sentences split at soft punctuation or whitespace, emoji/rune safety, whitespace normalization, invalid limits, and the invariant `utf8.RuneCountInString(chunk) <= maxRunes`. For example:
 
   ```go
   got, err := Split("你好世界。Go is fun!", 20)
-  want := []string{"你好世界。", "Go is fun!"}
+  want := []string{"你好世界。Go is fun!"}
   ```
 
 - [x] **Step 6: Run the chunker tests and verify the package is missing**
@@ -75,9 +75,9 @@
 
   Expected: FAIL because `Split` has not been defined.
 
-- [x] **Step 7: Implement rune-safe sentence splitting**
+- [x] **Step 7: Implement rune-safe paragraph-first splitting**
 
-  Detect hard sentence boundaries (`。！？!?` and an English full stop followed by whitespace/end), keep trailing closing quotes with the sentence, then split oversized sentences at the latest soft boundary (`，,；;：:、` or whitespace) inside the limit and hard-split only when no soft boundary exists.
+  Preserve blank-line-delimited natural paragraphs when they fit. For oversized paragraphs, detect hard sentence boundaries (`。！？!?` and an English full stop followed by whitespace/end), greedily pack adjacent sentences up to the limit, then split oversized sentences at the latest soft boundary (`，,；;：:、` or whitespace) and hard-split only when no soft boundary exists.
 
 - [x] **Step 8: Run focused and full tests**
 
@@ -166,7 +166,7 @@
 
 - [x] **Step 1: Write failing terminal-view output tests**
 
-  Render without color into a buffer and assert a literal header, `[1/2]` speaking line, completion marker, failure message, and final summary. The first sentence must appear as soon as `Speaking` is called.
+  Render without color into a buffer and assert a literal header, `[1/2]` speaking line, completion marker, failure message, and final summary. The first paragraph-sized unit must appear as soon as `Speaking` is called.
 
 - [x] **Step 2: Run the terminal tests and verify they fail**
 
@@ -176,7 +176,7 @@
 
 - [x] **Step 3: Implement the terminal view**
 
-  Print a compact header and append one sentence unit at a time. Escape C0/C1 controls from untrusted strings, propagate output errors, use ANSI bold/color only when enabled, keep no full-screen state, and show deterministic indexes and totals so redirected output remains useful.
+  Print a compact header and append one paragraph-sized unit at a time. Escape C0/C1 controls from untrusted strings, propagate output errors, use ANSI bold/color only when enabled, keep no full-screen state, and show deterministic indexes and totals so redirected output remains useful.
 
 - [x] **Step 4: Run the terminal tests and verify they pass**
 
@@ -210,7 +210,7 @@
 - Modify: `README.md`
 
 **Interfaces:**
-- Documents: build command, supported input, default system TTS behavior, sentence/limit behavior, flags, examples, controls, platform boundary, and test commands.
+- Documents: build command, supported input, default system TTS behavior, paragraph/limit behavior, flags, examples, controls, platform boundary, and test commands.
 
 - [x] **Step 1: Replace the placeholder README with shipped behavior**
 
@@ -230,4 +230,4 @@
 
 - [x] **Step 4: Review the final diff against all four product requirements**
 
-  Confirm one code/test/doc path for opening a document, default system TTS, per-call length enforcement, and sentence-level print-before-play ordering.
+  Confirm one code/test/doc path for opening a document, default system TTS, per-call length enforcement, and paragraph-level print-before-play ordering.
