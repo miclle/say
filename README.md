@@ -20,7 +20,8 @@ Space 播放/暂停 · ← 回退 5s · → 快进 5s
 
 ## 功能
 
-- 打开任意本地 UTF-8 纯文本文档；`.txt`、`.md` 等扩展名均可。
+- 打开任意本地 UTF-8 文本文档；`.txt` 按原文朗读，`.md` 和 `.markdown` 会先转换为适合朗读的语义文本。
+- Markdown 会移除 front matter、标题与强调标记、列表符号、链接地址、任务框和 HTML 标签；表格按行组织，结构化代码块会跳过，`text`/`plaintext` 代码块保留正文。
 - 交互式终端中如果没有传 `--provider`，会先显示 TTS provider 选择器；按上下方向键切换，按 Enter 确认。
 - 选择 `system` 时调用 macOS `/usr/bin/say`，使用“系统设置”中选择的声音和语速；每个自然段或限长片段会独立合成为临时 AIFF 音频。
 - 选择 `edge` 时使用实验性的 Microsoft Edge Read Aloud 在线服务并合成 MP3 音频；默认声音为 `zh-CN-XiaoxiaoNeural`。
@@ -126,7 +127,7 @@ go run ./cmd/say --provider edge --voice en-US-AriaNeural --speed 1.25 ./notes.m
 
 ## 文档边界
 
-当前版本面向纯文本内容：输入必须是本地普通文件、内容非空且采用 UTF-8 编码。Markdown 文件会按文本读取，不会移除标题、链接或代码标记；PDF、Word 和网页解析尚未包含在当前版本中。
+当前版本面向本地 UTF-8 文本内容：输入必须是普通文件且转换后仍有可朗读文字。Markdown 的标题、正文、列表、引用、表格、链接标签、图片 alt 文本和行内代码会保留语义内容；front matter、链接地址、裸 URL、HTML 标签以及 Go、Shell、JSON、Mermaid 等结构化代码块不会发送给 TTS。PDF、Word 和网页解析尚未包含在当前版本中。
 
 可定位音频播放当前只实现了 macOS。其他操作系统可以编译项目，但运行时会返回明确的不支持提示。临时 AIFF 或 MP3 音频存放在操作系统临时目录中，无论播放成功、失败还是被取消都会清理。每次 Edge TTS 网络调用最多等待 45 秒，并会随播放取消而终止。
 

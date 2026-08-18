@@ -29,9 +29,17 @@ func Read(path string) (name string, text string, err error) {
 	text = strings.TrimPrefix(string(data), "\ufeff")
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
+	if isMarkdownPath(path) {
+		text = markdownToNarration(text)
+	}
 	if strings.TrimSpace(text) == "" {
 		return "", "", fmt.Errorf("read document %q: document is empty", path)
 	}
 
 	return filepath.Base(path), text, nil
+}
+
+func isMarkdownPath(path string) bool {
+	extension := filepath.Ext(path)
+	return strings.EqualFold(extension, ".md") || strings.EqualFold(extension, ".markdown")
 }
