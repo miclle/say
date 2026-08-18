@@ -3,9 +3,11 @@ package terminal
 import (
 	"bytes"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
@@ -15,7 +17,6 @@ func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 	view.Start(2)
 	view.Speaking(0, 2, "第一句。")
 	view.Paused(0, 2)
-	view.Seeked(0, 2, -5*time.Second, 3*time.Second, 12*time.Second, true)
 	view.Resumed(0, 2)
 	view.Spoken(0, 2)
 	view.Buffering(1, 2)
@@ -27,16 +28,115 @@ func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 		"TTS  macOS say (system voice) · 2 speech units\n\n" +
 		"Space 播放/暂停 · ← 回退 5s · → 快进 5s\n\n" +
 		"[1/2] ▶ 第一句。\n" +
-		"      ⏸ paused\n" +
-		"      ↶ -5s · 00:03 / 00:12\n" +
-		"      ▶ resumed\n" +
-		"      ✓ played\n" +
+		"\x1b[1A\r\x1b[2K[1/2] ⏸ 第一句。\n" +
+		"\x1b[1A\r\x1b[2K[1/2] ▶ 第一句。\n" +
+		"\x1b[1A\r\x1b[2K[1/2] ✓ 第一句。\n" +
 		"      … buffering speech unit 2/2\n" +
 		"[2/2] ▶ Second.\n" +
 		"      ✗ voice unavailable\n\n" +
 		"✓ Finished 2 speech units.\n"
 	if got := output.String(); got != want {
 		t.Fatalf("output =\n%q\nwant =\n%q", got, want)
+	}
+}
+
+func TestViewSeekReplacesCurrentSentenceWithoutAppending(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, false, "notes.md", "test TTS")
+	view.Speaking(0, 2, "First.")
+
+	if err := view.Seeked(1, 2, "Second.", true, 5*time.Second, 6*time.Second, 12*time.Second, true); err != nil {
+		t.Fatalf("Seeked() error = %v", err)
+	}
+
+	want := "[1/2] ▶ First.\n" +
+		"\x1b[1A\r\x1b[2K[2/2] ▶ Second.\n"
+	if got := output.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestViewSeekKeepsPausedIcon(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, false, "notes.md", "test TTS")
+	view.Speaking(0, 2, "First.")
+
+	if err := view.Seeked(1, 2, "Second.", false, 5*time.Second, 6*time.Second, 12*time.Second, true); err != nil {
+		t.Fatalf("Seeked() error = %v", err)
+	}
+
+	want := "[1/2] ▶ First.\n" +
+		"\x1b[1A\r\x1b[2K[2/2] ⏸ Second.\n"
+	if got := output.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestViewMovesPlaybackProgressWithinStableChapterList(t *testing.T) {
+	screen := newTestTerminalScreen()
+	view := New(screen, false, "notes.md", "test TTS")
+	view.SetChapters([]string{"One.", "Two.", "Three."})
+
+	view.Start(3)
+	view.Speaking(0, 3, "One.")
+	view.Spoken(0, 3)
+	view.Speaking(1, 3, "Two.")
+	view.Seeked(2, 3, "Three.", true, 5*time.Second, 7*time.Second, 12*time.Second, true)
+	view.Seeked(0, 3, "One.", true, -5*time.Second, 2*time.Second, 12*time.Second, true)
+	view.Seeked(2, 3, "Three.", true, 5*time.Second, 7*time.Second, 12*time.Second, true)
+
+	want := []string{
+		"[1/3] ✓ One.",
+		"[2/3] · Two.",
+		"[3/3] ▶ Three.",
+	}
+	if got := screen.chapterLines(); !equalStrings(got, want) {
+		t.Fatalf("visible chapter lines = %#v, want %#v", got, want)
+	}
+}
+
+func TestViewKeepsCompletedIconWhenResumingDuringBuffering(t *testing.T) {
+	screen := newTestTerminalScreen()
+	view := New(screen, false, "notes.md", "test TTS")
+	view.SetChapters([]string{"One.", "Two."})
+
+	view.Start(2)
+	view.Speaking(0, 2, "One.")
+	view.Spoken(0, 2)
+	view.Buffering(1, 2)
+	view.Paused(0, 2)
+	view.Resumed(0, 2)
+
+	want := []string{
+		"[1/2] ✓ One.",
+		"[2/2] · Two.",
+	}
+	if got := screen.chapterLines(); !equalStrings(got, want) {
+		t.Fatalf("visible chapter lines = %#v, want %#v", got, want)
+	}
+}
+
+func TestViewRepaintsChapterListAfterTerminalResize(t *testing.T) {
+	screen := newTestTerminalScreen()
+	screen.setSize(80, 24)
+	view := New(screen, false, "notes.md", "test TTS")
+	view.SetChapters([]string{"One.", "Two.", "Three."})
+
+	view.Start(3)
+	view.Speaking(0, 3, "One.")
+	screen.setSize(40, 12)
+	view.Paused(0, 3)
+
+	if screen.clearScreenCount != 1 {
+		t.Fatalf("full-screen repaint count = %d, want 1 after terminal resize", screen.clearScreenCount)
+	}
+	want := []string{
+		"[1/3] ⏸ One.",
+		"[2/3] · Two.",
+		"[3/3] · Three.",
+	}
+	if got := screen.chapterLines(); !equalStrings(got, want) {
+		t.Fatalf("visible chapter lines = %#v, want %#v", got, want)
 	}
 }
 
@@ -49,6 +149,37 @@ func TestViewWritesSentenceWhenSpeakingStarts(t *testing.T) {
 
 	if got := output.String(); got != "say  notes.md\nTTS  test TTS · 1 speech unit\n\nSpace 播放/暂停 · ← 回退 5s · → 快进 5s\n\n[1/1] ▶ Visible before speech.\n" {
 		t.Fatalf("output after Speaking() = %q", got)
+	}
+}
+
+func TestViewUpdatesWrappedSentenceIconInPlace(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, false, "notes.md", "test TTS")
+	view.width = 10
+	text := "中文"
+
+	view.Speaking(0, 1, text)
+	view.Spoken(0, 1)
+
+	want := "[1/1] ▶ " + text + "\n" +
+		"\x1b[2A\r\x1b[2K[1/1] ✓ " + text + "\n"
+	if got := output.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestViewDoesNotEmitCursorUpdatesWithoutInteractiveControls(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, false, "notes.md", "test TTS")
+	view.SetControls(false)
+
+	view.Speaking(0, 1, "Plain transcript.")
+	view.Paused(0, 1)
+	view.Resumed(0, 1)
+	view.Spoken(0, 1)
+
+	if got, want := output.String(), "[1/1] ▶ Plain transcript.\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
 
@@ -74,19 +205,6 @@ func TestViewRendersPreparationOnce(t *testing.T) {
 		"… ready to play · 1/2 prepared\n" +
 		"Space 播放/暂停 · ← 回退 5s · → 快进 5s\n\n"
 	if got := output.String(); got != want {
-		t.Fatalf("output = %q, want %q", got, want)
-	}
-}
-
-func TestViewMarksIncompletePreparedDuration(t *testing.T) {
-	var output bytes.Buffer
-	view := New(&output, false, "notes.md", "test TTS")
-
-	if err := view.Seeked(0, 3, 5*time.Second, 8*time.Second, 12*time.Second, false); err != nil {
-		t.Fatalf("Seeked() error = %v", err)
-	}
-
-	if got, want := output.String(), "      ↷ +5s · 00:08 / 00:12+\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
@@ -137,4 +255,136 @@ type errorWriter struct {
 
 func (w errorWriter) Write([]byte) (int, error) {
 	return 0, w.err
+}
+
+type testTerminalScreen struct {
+	lines            [][]rune
+	row              int
+	col              int
+	width            int
+	height           int
+	clearScreenCount int
+}
+
+func newTestTerminalScreen() *testTerminalScreen {
+	return &testTerminalScreen{lines: make([][]rune, 1)}
+}
+
+func (s *testTerminalScreen) TerminalSize() (int, int, error) {
+	return s.width, s.height, nil
+}
+
+func (s *testTerminalScreen) setSize(width, height int) {
+	s.width = width
+	s.height = height
+}
+
+func (s *testTerminalScreen) Write(data []byte) (int, error) {
+	for offset := 0; offset < len(data); {
+		if data[offset] == '\x1b' && offset+1 < len(data) && data[offset+1] == '[' {
+			consumed := s.applyCSI(data[offset+2:])
+			if consumed > 0 {
+				offset += consumed + 2
+				continue
+			}
+		}
+		switch data[offset] {
+		case '\n':
+			s.row++
+			s.col = 0
+			s.ensureRow()
+			offset++
+		case '\r':
+			s.col = 0
+			offset++
+		default:
+			r, size := utf8.DecodeRune(data[offset:])
+			s.writeRune(r)
+			offset += size
+		}
+	}
+	return len(data), nil
+}
+
+func (s *testTerminalScreen) applyCSI(data []byte) int {
+	command := -1
+	for i, b := range data {
+		if b >= '@' && b <= '~' {
+			command = i
+			break
+		}
+	}
+	if command < 0 {
+		return 0
+	}
+	parameter := string(data[:command])
+	value := 1
+	if parameter != "" {
+		parsed, err := strconv.Atoi(parameter)
+		if err != nil {
+			return 0
+		}
+		value = parsed
+	}
+	switch data[command] {
+	case 'A':
+		s.row -= value
+		if s.row < 0 {
+			s.row = 0
+		}
+	case 'B':
+		s.row += value
+		s.ensureRow()
+	case 'K':
+		if value == 2 {
+			s.lines[s.row] = nil
+		}
+	case 'H':
+		s.row = 0
+		s.col = 0
+	case 'J':
+		if value == 2 {
+			s.lines = make([][]rune, 1)
+			s.clearScreenCount++
+		}
+	}
+	return command + 1
+}
+
+func (s *testTerminalScreen) writeRune(r rune) {
+	s.ensureRow()
+	for len(s.lines[s.row]) <= s.col {
+		s.lines[s.row] = append(s.lines[s.row], ' ')
+	}
+	s.lines[s.row][s.col] = r
+	s.col++
+}
+
+func (s *testTerminalScreen) ensureRow() {
+	for len(s.lines) <= s.row {
+		s.lines = append(s.lines, nil)
+	}
+}
+
+func (s *testTerminalScreen) chapterLines() []string {
+	var chapters []string
+	for _, line := range s.lines {
+		text := strings.TrimRight(string(line), " ")
+		if strings.HasPrefix(text, "[") {
+			chapters = append(chapters, text)
+		}
+	}
+	return chapters
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }

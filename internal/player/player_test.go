@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -116,14 +117,21 @@ func TestPlayForwardSeekWaitsForUnpreparedTrack(t *testing.T) {
 	transport.waitForEvent(t, "play:one.aiff")
 	transport.setPosition(time.Second)
 	commands <- Forward
-	transport.waitForEvent(t, "buffering:1:2")
-	if transport.isPlaying() {
-		t.Fatal("transport kept playing while a forward seek waited for unprepared audio")
-	}
-
 	results <- trackResult("second", "two.aiff", 8*time.Second)
 	transport.waitForEvent(t, "seek:two.aiff:2s")
 	transport.waitForEvent(t, "seeked:1:5s:6s:12s:true")
+	events := transport.snapshot()
+	seekedAt := slices.Index(events, "seeked:1:5s:6s:12s:true")
+	playAt := slices.Index(events, "play:two.aiff")
+	if seekedAt < 0 || playAt < 0 || seekedAt > playAt {
+		t.Fatalf("events = %#v, want seek target rendered before playback resumes", events)
+	}
+	if got := transport.countEvent("pause"); got != 1 {
+		t.Fatalf("pause event count = %d, want playback paused while waiting for the seek target", got)
+	}
+	if got := transport.countEvent("buffering:"); got != 0 {
+		t.Fatalf("buffering event count = %d, want no output event for a direction-key seek", got)
+	}
 	if !transport.isPlaying() {
 		t.Fatal("playing forward seek did not resume at the prepared target")
 	}
@@ -151,7 +159,6 @@ func TestPlayPausedForwardSeekStaysPausedAfterPreparation(t *testing.T) {
 	commands <- Toggle
 	transport.waitForEvent(t, "paused:0")
 	commands <- Forward
-	transport.waitForEvent(t, "buffering:1:2")
 	results <- trackResult("second", "two.aiff", 8*time.Second)
 	transport.waitForEvent(t, "seek:two.aiff:2s")
 
@@ -190,6 +197,9 @@ func TestPlayBackwardSeekAcrossPreparedTracksIsImmediate(t *testing.T) {
 	transport.setPosition(time.Second)
 	commands <- Backward
 	transport.waitForEvent(t, "seeked:0:-5s:0s:12s:true")
+	if got := transport.countEvent("speaking:"); got != 1 {
+		t.Fatalf("speaking event count = %d, want only the initial non-seek render", got)
+	}
 	if path, position := transport.current(); path != "one.aiff" || position != 0 {
 		t.Fatalf("transport = %q at %s, want one.aiff at 0s", path, position)
 	}
@@ -448,7 +458,7 @@ func (v *recordingView) Buffering(index, total int) error {
 	v.events.add(fmt.Sprintf("buffering:%d:%d", index, total))
 	return nil
 }
-func (v *recordingView) Seeked(index, _ int, delta, position, duration time.Duration, complete bool) error {
+func (v *recordingView) Seeked(index, _ int, _ string, _ bool, delta, position, duration time.Duration, complete bool) error {
 	v.events.add(fmt.Sprintf("seeked:%d:%s:%s:%s:%t", index, delta, position, duration, complete))
 	return nil
 }

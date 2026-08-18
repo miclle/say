@@ -170,6 +170,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	}
 
 	view := terminal.New(stdout, !*noColor && deps.supportsTerminal(stdout), title, synthesizer.Name())
+	view.SetChapters(chunks)
 	view.SetControls(interactive)
 	if err := view.Preparing(len(chunks)); err != nil {
 		fmt.Fprintf(stderr, "say: render preparation: %v\n", err)

@@ -57,7 +57,7 @@ type View interface {
 	Paused(index, total int) error
 	Resumed(index, total int) error
 	Buffering(index, total int) error
-	Seeked(index, total int, delta, position, duration time.Duration, complete bool) error
+	Seeked(index, total int, text string, playing bool, delta, position, duration time.Duration, complete bool) error
 	Failed(index, total int, err error) error
 	Finish(total int) error
 }
@@ -309,9 +309,6 @@ func (p *streamPlayer) requestSeek(delta time.Duration) (bool, error) {
 	}
 	p.waiting = false
 	p.pending = &pendingSeek{target: target, delta: delta}
-	if err := p.view.Buffering(len(p.tracks), p.total); err != nil {
-		return false, fmt.Errorf("render buffering state: %w", err)
-	}
 	return false, nil
 }
 
@@ -328,13 +325,13 @@ func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (
 		}
 		if p.current != last || !p.active {
 			p.current = last
-			if err := p.activateAt(p.current, p.tracks[last].Duration, false); err != nil {
+			if err := p.activateAt(p.current, p.tracks[last].Duration, false, false); err != nil {
 				return false, err
 			}
 		} else if err := p.transport.Seek(p.tracks[last].Duration); err != nil {
 			return false, fmt.Errorf("seek to document end: %w", err)
 		}
-		if err := p.view.Seeked(last, p.total, delta, target, knownDuration, true); err != nil {
+		if err := p.view.Seeked(last, p.total, p.tracks[last].Text, p.playing, delta, target, knownDuration, true); err != nil {
 			return false, fmt.Errorf("render seek state: %w", err)
 		}
 		return true, nil
@@ -345,9 +342,10 @@ func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (
 		index++
 	}
 	local := target - p.offsets[index]
-	if index != p.current || !p.active {
+	activateTarget := index != p.current || !p.active
+	if activateTarget {
 		p.current = index
-		if err := p.activateAt(index, local, p.playing); err != nil {
+		if err := p.activateAt(index, local, false, false); err != nil {
 			return false, err
 		}
 	} else if err := p.transport.Seek(local); err != nil {
@@ -356,8 +354,13 @@ func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (
 	p.active = true
 	p.waiting = false
 	p.spoken = false
-	if err := p.view.Seeked(index, p.total, delta, target, knownDuration, complete); err != nil {
+	if err := p.view.Seeked(index, p.total, p.tracks[index].Text, p.playing, delta, target, knownDuration, complete); err != nil {
 		return false, fmt.Errorf("render seek state: %w", err)
+	}
+	if activateTarget && p.playing {
+		if err := p.transport.Play(); err != nil {
+			return false, fmt.Errorf("play track %d of %d after seek: %w", index+1, p.total, err)
+		}
 	}
 	return false, nil
 }
@@ -394,16 +397,18 @@ func (p *streamPlayer) handleTick() (bool, error) {
 }
 
 func (p *streamPlayer) activate(index int, position time.Duration) error {
-	return p.activateAt(index, position, p.playing)
+	return p.activateAt(index, position, p.playing, true)
 }
 
-func (p *streamPlayer) activateAt(index int, position time.Duration, shouldPlay bool) error {
+func (p *streamPlayer) activateAt(index int, position time.Duration, shouldPlay, render bool) error {
 	track := p.tracks[index]
 	if err := p.transport.Load(track.Path); err != nil {
 		return fmt.Errorf("load track %d of %d: %w", index+1, p.total, err)
 	}
-	if err := p.view.Speaking(index, p.total, track.Text); err != nil {
-		return fmt.Errorf("render track %d of %d before playback: %w", index+1, p.total, err)
+	if render {
+		if err := p.view.Speaking(index, p.total, track.Text); err != nil {
+			return fmt.Errorf("render track %d of %d before playback: %w", index+1, p.total, err)
+		}
 	}
 	if position > 0 {
 		if err := p.transport.Seek(position); err != nil {

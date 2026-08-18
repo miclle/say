@@ -321,6 +321,34 @@ func TestRunEnablesInteractiveShortcutsAndRestoresTerminal(t *testing.T) {
 	}
 }
 
+func TestRunRendersContiguousInteractiveChapterListBeforePlayback(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "first paragraph\n\nsecond paragraph\n\nthird paragraph")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	transport := newFakeAudio(&stdout, synthesizer)
+	deps := testDependencies(synthesizer, transport)
+	deps.input = bytes.NewReader(nil)
+	deps.supportsTerminal = func(any) bool { return true }
+	deps.beginRaw = func(io.Reader) (func() error, error) {
+		return func() error { return nil }, nil
+	}
+
+	code := runWithDependencies(context.Background(), []string{"--provider", "system", "--no-color", path}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	firstFrame := transport.firstOutputBeforePlay()
+	for _, line := range []string{
+		"[1/3] ▶ first paragraph",
+		"[2/3] · second paragraph",
+		"[3/3] · third paragraph",
+	} {
+		if !strings.Contains(firstFrame, line) {
+			t.Fatalf("first playback frame = %q, want contiguous chapter line %q", firstFrame, line)
+		}
+	}
+}
+
 func TestRunCleansTemporaryAudioAfterSynthesisFailure(t *testing.T) {
 	path := writeDocument(t, "lesson.txt", "first paragraph\n\nsecond paragraph")
 	var stdout, stderr bytes.Buffer
@@ -624,6 +652,7 @@ type fakeAudio struct {
 	finishAfterPlay   int
 	events            []string
 	visibleBeforePlay []bool
+	outputBeforePlay  []string
 	playStarted       chan struct{}
 	playStartedOnce   sync.Once
 }
@@ -646,6 +675,7 @@ func (a *fakeAudio) Play() error {
 	a.playCount++
 	a.playing = a.playCount < a.finishAfterPlay
 	a.events = append(a.events, "play")
+	a.outputBeforePlay = append(a.outputBeforePlay, a.output.String())
 	if a.synthesizer != nil {
 		a.visibleBeforePlay = append(a.visibleBeforePlay, strings.Contains(a.output.String(), a.synthesizer.textForPath(a.path)))
 	}
@@ -653,6 +683,15 @@ func (a *fakeAudio) Play() error {
 		a.playStartedOnce.Do(func() { close(a.playStarted) })
 	}
 	return nil
+}
+
+func (a *fakeAudio) firstOutputBeforePlay() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.outputBeforePlay) == 0 {
+		return ""
+	}
+	return a.outputBeforePlay[0]
 }
 func (a *fakeAudio) Pause() {
 	a.mu.Lock()
