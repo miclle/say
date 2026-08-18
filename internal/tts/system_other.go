@@ -8,7 +8,7 @@ import (
 )
 
 // NewSystem reports that the initial system TTS adapter is macOS-only.
-func NewSystem(_ string, rate int) (Speaker, error) {
+func NewSystem(_ string, rate int) (Synthesizer, error) {
 	if rate < 0 {
 		return nil, fmt.Errorf("rate must not be negative")
 	}

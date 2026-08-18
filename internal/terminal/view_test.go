@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
@@ -13,6 +14,9 @@ func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 
 	view.Start(2)
 	view.Speaking(0, 2, "第一句。")
+	view.Paused(0, 2)
+	view.Seeked(0, 2, -5*time.Second, 3*time.Second, 12*time.Second)
+	view.Resumed(0, 2)
 	view.Spoken(0, 2)
 	view.Speaking(1, 2, "Second.")
 	view.Failed(1, 2, errors.New("voice unavailable"))
@@ -20,7 +24,11 @@ func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 
 	want := "say  lesson.txt\n" +
 		"TTS  macOS say (system voice) · 2 speech units\n\n" +
+		"Space 播放/暂停 · ← 回退 5s · → 快进 5s\n\n" +
 		"[1/2] ▶ 第一句。\n" +
+		"      ⏸ paused\n" +
+		"      ↶ -5s · 00:03 / 00:12\n" +
+		"      ▶ resumed\n" +
 		"      ✓ played\n" +
 		"[2/2] ▶ Second.\n" +
 		"      ✗ voice unavailable\n\n" +
@@ -37,8 +45,25 @@ func TestViewWritesSentenceWhenSpeakingStarts(t *testing.T) {
 	view.Start(1)
 	view.Speaking(0, 1, "Visible before speech.")
 
-	if got := output.String(); got != "say  notes.md\nTTS  test TTS · 1 speech unit\n\n[1/1] ▶ Visible before speech.\n" {
+	if got := output.String(); got != "say  notes.md\nTTS  test TTS · 1 speech unit\n\nSpace 播放/暂停 · ← 回退 5s · → 快进 5s\n\n[1/1] ▶ Visible before speech.\n" {
 		t.Fatalf("output after Speaking() = %q", got)
+	}
+}
+
+func TestViewRendersPreparationOnce(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, false, "notes.md", "test TTS")
+
+	if err := view.Preparing(2); err != nil {
+		t.Fatalf("Preparing() error = %v", err)
+	}
+	if err := view.Start(2); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	want := "say  notes.md\nTTS  test TTS · 2 speech units\n\n… preparing 2 audio tracks\nSpace 播放/暂停 · ← 回退 5s · → 快进 5s\n\n"
+	if got := output.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
 

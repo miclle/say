@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func TestSystemSpeakerSendsOptionsAsArgumentsAndTextOnStdin(t *testing.T) {
+func TestSystemSynthesizerSendsOutputAndOptionsAsArgumentsAndTextOnStdin(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "args")
 	stdinPath := filepath.Join(dir, "stdin")
@@ -23,16 +23,17 @@ printf '%s\n' "$@" > "$SAY_TEST_ARGS"
 cat > "$SAY_TEST_STDIN"
 `)
 
-	speaker := newSystemSpeaker(executable, "Tingting", 210)
-	if err := speaker.Speak(context.Background(), "你好；$(touch should-not-run)"); err != nil {
-		t.Fatalf("Speak() error = %v", err)
+	synthesizer := newSystemSynthesizer(executable, "Tingting", 210)
+	outputPath := filepath.Join(dir, "speech.aiff")
+	if err := synthesizer.Synthesize(context.Background(), "你好；$(touch should-not-run)", outputPath); err != nil {
+		t.Fatalf("Synthesize() error = %v", err)
 	}
 
 	args, err := os.ReadFile(argsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := string(args), "-v\nTingting\n-r\n210\n"; got != want {
+	if got, want := string(args), "-o\n"+outputPath+"\n-v\nTingting\n-r\n210\n"; got != want {
 		t.Fatalf("arguments = %q, want %q", got, want)
 	}
 	stdin, err := os.ReadFile(stdinPath)
@@ -44,12 +45,33 @@ cat > "$SAY_TEST_STDIN"
 	}
 }
 
-func TestSystemSpeakerReturnsCommandDiagnostics(t *testing.T) {
+func TestSystemSynthesizerReturnsCommandDiagnostics(t *testing.T) {
 	executable := writeExecutable(t, t.TempDir(), "failure", "#!/bin/sh\necho 'voice unavailable' >&2\nexit 7\n")
 
-	err := newSystemSpeaker(executable, "", 0).Speak(context.Background(), "hello")
+	err := newSystemSynthesizer(executable, "", 0).Synthesize(context.Background(), "hello", filepath.Join(t.TempDir(), "speech.aiff"))
 	if err == nil || !strings.Contains(err.Error(), "voice unavailable") {
-		t.Fatalf("Speak() error = %v, want command diagnostic", err)
+		t.Fatalf("Synthesize() error = %v, want command diagnostic", err)
+	}
+}
+
+func TestSystemSynthesizerRejectsEmptyInput(t *testing.T) {
+	synthesizer := newSystemSynthesizer("unused", "", 0)
+
+	for _, tt := range []struct {
+		name       string
+		text       string
+		outputPath string
+		want       string
+	}{
+		{name: "text", text: " \n", outputPath: "speech.aiff", want: "speech text is empty"},
+		{name: "output", text: "hello", outputPath: "", want: "output path is empty"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := synthesizer.Synthesize(context.Background(), tt.text, tt.outputPath)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Synthesize() error = %v, want containing %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -60,7 +82,7 @@ func TestNewSystemRejectsNegativeRate(t *testing.T) {
 	}
 }
 
-func TestSystemSpeakerTerminatesProcessWhenCanceled(t *testing.T) {
+func TestSystemSynthesizerTerminatesProcessWhenCanceled(t *testing.T) {
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")
 	t.Setenv("SAY_TEST_READY", readyPath)
@@ -69,7 +91,7 @@ func TestSystemSpeakerTerminatesProcessWhenCanceled(t *testing.T) {
 	done := make(chan error, 1)
 
 	go func() {
-		done <- newSystemSpeaker(executable, "", 0).Speak(ctx, "hello")
+		done <- newSystemSynthesizer(executable, "", 0).Synthesize(ctx, "hello", filepath.Join(dir, "speech.aiff"))
 	}()
 	waitForFile(t, readyPath)
 	cancel()
@@ -77,10 +99,10 @@ func TestSystemSpeakerTerminatesProcessWhenCanceled(t *testing.T) {
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Speak() error = %v, want context.Canceled", err)
+			t.Fatalf("Synthesize() error = %v, want context.Canceled", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Speak() did not terminate promptly after cancellation")
+		t.Fatal("Synthesize() did not terminate promptly after cancellation")
 	}
 }
 

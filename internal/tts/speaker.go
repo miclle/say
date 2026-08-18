@@ -2,8 +2,8 @@ package tts
 
 import "context"
 
-// Speaker converts one bounded text unit to audible speech and blocks until it finishes.
-type Speaker interface {
+// Synthesizer converts one bounded text unit into an audio file.
+type Synthesizer interface {
 	Name() string
-	Speak(ctx context.Context, text string) error
+	Synthesize(ctx context.Context, text, outputPath string) error
 }
