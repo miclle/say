@@ -23,6 +23,7 @@ type View struct {
 	engine   string
 	header   bool
 	controls bool
+	started  bool
 }
 
 // New creates a terminal playback view.
@@ -35,12 +36,21 @@ func (v *View) SetControls(enabled bool) {
 	v.controls = enabled
 }
 
-// Preparing announces the up-front synthesis needed for seekable playback.
+// Preparing announces that ordered audio preparation is starting.
 func (v *View) Preparing(total int) error {
 	if err := v.writeHeader(total); err != nil {
 		return err
 	}
-	_, err := fmt.Fprintf(v.writer, "… preparing %d audio %s\n", total, trackWord(total))
+	_, err := fmt.Fprintf(v.writer, "… preparing audio · 0/%d ready\n", total)
+	return err
+}
+
+// Prepared renders preparation progress until playback starts.
+func (v *View) Prepared(prepared, total int) error {
+	if v.started {
+		return nil
+	}
+	_, err := fmt.Fprintf(v.writer, "… ready to play · %d/%d prepared\n", prepared, total)
 	return err
 }
 
@@ -54,6 +64,9 @@ func (v *View) Start(total int) error {
 		}
 	}
 	_, err := fmt.Fprintln(v.writer)
+	if err == nil {
+		v.started = true
+	}
 	return err
 }
 
@@ -91,12 +104,22 @@ func (v *View) Resumed(_, _ int) error {
 	return err
 }
 
-func (v *View) Seeked(_, _ int, delta, position, duration time.Duration) error {
+// Buffering reports that playback reached audio which is still being prepared.
+func (v *View) Buffering(index, total int) error {
+	_, err := fmt.Fprintf(v.writer, "      … buffering speech unit %d/%d\n", index+1, total)
+	return err
+}
+
+func (v *View) Seeked(_, _ int, delta, position, duration time.Duration, complete bool) error {
 	icon := "↶"
 	if delta > 0 {
 		icon = "↷"
 	}
-	_, err := fmt.Fprintf(v.writer, "      %s %s · %s / %s\n", icon, signedSeconds(delta), clock(position), clock(duration))
+	suffix := ""
+	if !complete {
+		suffix = "+"
+	}
+	_, err := fmt.Fprintf(v.writer, "      %s %s · %s / %s%s\n", icon, signedSeconds(delta), clock(position), clock(duration), suffix)
 	return err
 }
 
@@ -122,13 +145,6 @@ func unitWord(total int) string {
 		return "unit"
 	}
 	return "units"
-}
-
-func trackWord(total int) string {
-	if total == 1 {
-		return "track"
-	}
-	return "tracks"
 }
 
 func signedSeconds(duration time.Duration) string {

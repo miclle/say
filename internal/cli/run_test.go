@@ -44,12 +44,55 @@ func TestRunSynthesizesEveryBoundedChunkAndCleansTemporaryAudio(t *testing.T) {
 			t.Fatalf("temporary audio %q still exists; stat error = %v", outputPath, err)
 		}
 	}
-	if !strings.Contains(stdout.String(), "… preparing 2 audio tracks") ||
+	if !strings.Contains(stdout.String(), "… preparing audio · 0/2 ready") ||
+		!strings.Contains(stdout.String(), "… ready to play · 1/2 prepared") ||
 		!strings.Contains(stdout.String(), "✓ Finished 2 speech units.") {
 		t.Fatalf("stdout = %q, want preparation and completion", stdout.String())
 	}
 	if strings.Contains(stdout.String(), "Space 播放/暂停") {
 		t.Fatalf("redirected output advertised unavailable controls: %q", stdout.String())
+	}
+}
+
+func TestRunStartsPlaybackBeforeSecondTrackFinishesSynthesis(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "first paragraph\n\nsecond paragraph")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newBlockingSecondSynthesizer()
+	transport := newFakeAudio(&stdout, nil)
+	transport.playStarted = make(chan struct{})
+	deps := dependencies{
+		input: bytes.NewReader(nil),
+		newSynthesizer: func(string, int) (tts.Synthesizer, error) {
+			return synthesizer, nil
+		},
+		newTransport:     func() (audioTransport, error) { return transport, nil },
+		readDuration:     func(string) (time.Duration, error) { return 20 * time.Second, nil },
+		supportsTerminal: func(any) bool { return false },
+		beginRaw: func(io.Reader) (func() error, error) {
+			return nil, fmt.Errorf("must not enable raw input")
+		},
+	}
+	done := make(chan int, 1)
+
+	go func() {
+		done <- runWithDependencies(context.Background(), []string{"--no-color", path}, &stdout, &stderr, deps)
+	}()
+	select {
+	case <-synthesizer.secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second synthesis did not start")
+	}
+
+	select {
+	case <-transport.playStarted:
+	case <-time.After(300 * time.Millisecond):
+		close(synthesizer.releaseSecond)
+		<-done
+		t.Fatal("first track did not start before second synthesis completed")
+	}
+	close(synthesizer.releaseSecond)
+	if code := <-done; code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
 	}
 }
 
@@ -83,9 +126,13 @@ func TestRunEnablesInteractiveShortcutsAndRestoresTerminal(t *testing.T) {
 	synthesizer := newFakeSynthesizer()
 	transport := newFakeAudio(&stdout, synthesizer)
 	transport.finishAfterPlay = 2
+	transport.playStarted = make(chan struct{})
 	restored := false
 	deps := testDependencies(synthesizer, transport)
-	deps.input = bytes.NewBufferString(" \x1b[C\x1b[D ")
+	deps.input = &gatedReader{
+		gate:   transport.playStarted,
+		reader: bytes.NewBufferString(" \x1b[C\x1b[D "),
+	}
 	deps.supportsTerminal = func(any) bool { return true }
 	deps.beginRaw = func(io.Reader) (func() error, error) {
 		return func() error {
@@ -124,6 +171,68 @@ func TestRunCleansTemporaryAudioAfterSynthesisFailure(t *testing.T) {
 		if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("temporary audio %q still exists; stat error = %v", outputPath, err)
 		}
+	}
+}
+
+func TestRunCancellationStopsPreparationBeforeCleanupAndRestoresTerminal(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "first paragraph\n\nsecond paragraph")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	synthesizer := newCancellationSynthesizer()
+	transport := newFakeAudio(&stdout, nil)
+	restored := false
+	deps := dependencies{
+		input: bytes.NewReader(nil),
+		newSynthesizer: func(string, int) (tts.Synthesizer, error) {
+			return synthesizer, nil
+		},
+		newTransport: func() (audioTransport, error) { return transport, nil },
+		readDuration: func(string) (time.Duration, error) {
+			return 20 * time.Second, nil
+		},
+		supportsTerminal: func(any) bool { return true },
+		beginRaw: func(io.Reader) (func() error, error) {
+			return func() error {
+				restored = true
+				return nil
+			}, nil
+		},
+	}
+	done := make(chan int, 1)
+
+	go func() {
+		done <- runWithDependencies(ctx, []string{"--no-color", path}, &stdout, &stderr, deps)
+	}()
+	select {
+	case <-synthesizer.secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second synthesis did not start")
+	}
+	cancel()
+	select {
+	case code := <-done:
+		if code != 130 {
+			t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runWithDependencies() did not stop after cancellation")
+	}
+	select {
+	case <-synthesizer.exited:
+	default:
+		t.Fatal("run returned before the blocked synthesizer exited")
+	}
+	if !synthesizer.tempPresentWhenCanceled() {
+		t.Fatal("temporary audio was removed before the synthesizer exited")
+	}
+	if firstPath := synthesizer.firstOutputPath(); firstPath == "" {
+		t.Fatal("first output path was not recorded")
+	} else if _, err := os.Stat(firstPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary audio %q still exists; stat error = %v", firstPath, err)
+	}
+	if !restored {
+		t.Fatal("terminal restore function was not called")
 	}
 }
 
@@ -175,6 +284,7 @@ func testDependencies(synthesizer *fakeSynthesizer, transport *fakeAudio) depend
 			return synthesizer, nil
 		},
 		newTransport:     func() (audioTransport, error) { return transport, nil },
+		readDuration:     func(string) (time.Duration, error) { return 20 * time.Second, nil },
 		supportsTerminal: func(any) bool { return false },
 		beginRaw: func(io.Reader) (func() error, error) {
 			return nil, fmt.Errorf("must not enable raw input")
@@ -183,12 +293,96 @@ func testDependencies(synthesizer *fakeSynthesizer, transport *fakeAudio) depend
 }
 
 type fakeSynthesizer struct {
+	mu     sync.Mutex
 	voice  string
 	rate   int
 	texts  []string
 	paths  []string
 	byPath map[string]string
 	failAt int
+}
+
+type blockingSecondSynthesizer struct {
+	mu            sync.Mutex
+	calls         int
+	secondStarted chan struct{}
+	releaseSecond chan struct{}
+}
+
+type cancellationSynthesizer struct {
+	mu                  sync.Mutex
+	calls               int
+	firstPath           string
+	tempPresentOnCancel bool
+	secondStarted       chan struct{}
+	exited              chan struct{}
+}
+
+func newCancellationSynthesizer() *cancellationSynthesizer {
+	return &cancellationSynthesizer{
+		secondStarted: make(chan struct{}),
+		exited:        make(chan struct{}),
+	}
+}
+
+func (s *cancellationSynthesizer) Name() string { return "canceling test TTS" }
+
+func (s *cancellationSynthesizer) Synthesize(ctx context.Context, text, outputPath string) error {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	if call == 1 {
+		s.firstPath = outputPath
+	}
+	s.mu.Unlock()
+	if call == 1 {
+		return os.WriteFile(outputPath, []byte(text), 0o600)
+	}
+	close(s.secondStarted)
+	<-ctx.Done()
+	_, err := os.Stat(s.firstOutputPath())
+	s.mu.Lock()
+	s.tempPresentOnCancel = err == nil
+	s.mu.Unlock()
+	close(s.exited)
+	return ctx.Err()
+}
+
+func (s *cancellationSynthesizer) firstOutputPath() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.firstPath
+}
+
+func (s *cancellationSynthesizer) tempPresentWhenCanceled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tempPresentOnCancel
+}
+
+func newBlockingSecondSynthesizer() *blockingSecondSynthesizer {
+	return &blockingSecondSynthesizer{
+		secondStarted: make(chan struct{}),
+		releaseSecond: make(chan struct{}),
+	}
+}
+
+func (s *blockingSecondSynthesizer) Name() string { return "blocking test TTS" }
+
+func (s *blockingSecondSynthesizer) Synthesize(ctx context.Context, text, outputPath string) error {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 2 {
+		close(s.secondStarted)
+		select {
+		case <-s.releaseSecond:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return os.WriteFile(outputPath, []byte(text), 0o600)
 }
 
 func newFakeSynthesizer() *fakeSynthesizer {
@@ -198,6 +392,8 @@ func newFakeSynthesizer() *fakeSynthesizer {
 func (s *fakeSynthesizer) Name() string { return "test TTS" }
 
 func (s *fakeSynthesizer) Synthesize(_ context.Context, text, outputPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	index := len(s.texts)
 	s.texts = append(s.texts, text)
 	s.paths = append(s.paths, outputPath)
@@ -206,6 +402,12 @@ func (s *fakeSynthesizer) Synthesize(_ context.Context, text, outputPath string)
 		return fmt.Errorf("synthesis failed")
 	}
 	return os.WriteFile(outputPath, []byte("audio"), 0o600)
+}
+
+func (s *fakeSynthesizer) textForPath(path string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byPath[path]
 }
 
 type fakeAudio struct {
@@ -219,6 +421,8 @@ type fakeAudio struct {
 	finishAfterPlay   int
 	events            []string
 	visibleBeforePlay []bool
+	playStarted       chan struct{}
+	playStartedOnce   sync.Once
 }
 
 func newFakeAudio(output *bytes.Buffer, synthesizer *fakeSynthesizer) *fakeAudio {
@@ -239,7 +443,12 @@ func (a *fakeAudio) Play() error {
 	a.playCount++
 	a.playing = a.playCount < a.finishAfterPlay
 	a.events = append(a.events, "play")
-	a.visibleBeforePlay = append(a.visibleBeforePlay, strings.Contains(a.output.String(), a.synthesizer.byPath[a.path]))
+	if a.synthesizer != nil {
+		a.visibleBeforePlay = append(a.visibleBeforePlay, strings.Contains(a.output.String(), a.synthesizer.textForPath(a.path)))
+	}
+	if a.playStarted != nil {
+		a.playStartedOnce.Do(func() { close(a.playStarted) })
+	}
 	return nil
 }
 func (a *fakeAudio) Pause() {
@@ -281,6 +490,17 @@ func (a *fakeAudio) snapshot() []string {
 }
 
 var _ player.Transport = (*fakeAudio)(nil)
+
+type gatedReader struct {
+	gate   <-chan struct{}
+	reader io.Reader
+	once   sync.Once
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { <-r.gate })
+	return r.reader.Read(p)
+}
 
 func writeDocument(t *testing.T, name, content string) string {
 	t.Helper()

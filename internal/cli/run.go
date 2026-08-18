@@ -22,12 +22,12 @@ const defaultMaxChars = 500
 
 type synthesizerFactory func(voice string, rate int) (tts.Synthesizer, error)
 type transportFactory func() (audioTransport, error)
+type durationReader func(path string) (time.Duration, error)
 type terminalDetector func(value any) bool
 type rawInputFactory func(input io.Reader) (restore func() error, err error)
 
 type audioTransport interface {
 	player.Transport
-	Duration(path string) (time.Duration, error)
 	Close() error
 }
 
@@ -35,6 +35,7 @@ type dependencies struct {
 	input            io.Reader
 	newSynthesizer   synthesizerFactory
 	newTransport     transportFactory
+	readDuration     durationReader
 	supportsTerminal terminalDetector
 	beginRaw         rawInputFactory
 }
@@ -47,6 +48,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		newTransport: func() (audioTransport, error) {
 			return audio.New()
 		},
+		readDuration:     audio.Duration,
 		supportsTerminal: isCharacterDevice,
 		beginRaw: func(input io.Reader) (func() error, error) {
 			file, ok := input.(*os.File)
@@ -130,44 +132,12 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	}
 	defer os.RemoveAll(tempDir)
 
-	tracks := make([]player.Track, 0, len(chunks))
-	for i, chunk := range chunks {
-		if err := ctx.Err(); err != nil {
-			fmt.Fprintf(stderr, "say: playback interrupted: %v\n", err)
-			return 130
-		}
-		outputPath := filepath.Join(tempDir, fmt.Sprintf("%06d.aiff", i+1))
-		if err := synthesizer.Synthesize(ctx, chunk, outputPath); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				err = ctxErr
-			}
-			fmt.Fprintf(stderr, "say: synthesize track %d of %d: %v\n", i+1, len(chunks), err)
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return 130
-			}
-			return 1
-		}
-		tracks = append(tracks, player.Track{Text: chunk, Path: outputPath})
-	}
-
 	transport, err := deps.newTransport()
 	if err != nil {
 		fmt.Fprintf(stderr, "say: initialize audio playback: %v\n", err)
 		return 1
 	}
 	defer transport.Close()
-	for i := range tracks {
-		duration, err := transport.Duration(tracks[i].Path)
-		if err != nil {
-			fmt.Fprintf(stderr, "say: inspect track %d of %d: %v\n", i+1, len(tracks), err)
-			return 1
-		}
-		if duration <= 0 {
-			fmt.Fprintf(stderr, "say: inspect track %d of %d: audio duration must be greater than zero\n", i+1, len(tracks))
-			return 1
-		}
-		tracks[i].Duration = duration
-	}
 
 	var commands <-chan player.Command
 	restore := func() error { return nil }
@@ -183,7 +153,11 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		commands = terminal.ReadCommands(commandCtx, deps.input)
 	}
 
-	playbackErr := player.Play(ctx, tracks, transport, commands, view)
+	preparationCtx, cancelPreparation := context.WithCancel(ctx)
+	results, preparationDone := prepareTracks(preparationCtx, chunks, tempDir, synthesizer, deps.readDuration)
+	playbackErr := player.Play(ctx, len(chunks), results, transport, commands, view)
+	cancelPreparation()
+	<-preparationDone
 	cancelCommands()
 	restoreErr := restore()
 	if playbackErr != nil {
@@ -199,6 +173,64 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		return 1
 	}
 	return 0
+}
+
+func prepareTracks(
+	ctx context.Context,
+	chunks []string,
+	tempDir string,
+	synthesizer tts.Synthesizer,
+	readDuration durationReader,
+) (<-chan player.TrackResult, <-chan struct{}) {
+	results := make(chan player.TrackResult)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer close(results)
+		for i, chunk := range chunks {
+			if ctx.Err() != nil {
+				return
+			}
+			outputPath := filepath.Join(tempDir, fmt.Sprintf("%06d.aiff", i+1))
+			if err := synthesizer.Synthesize(ctx, chunk, outputPath); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return
+				}
+				sendTrackResult(ctx, results, player.TrackResult{
+					Err: fmt.Errorf("synthesize track %d of %d: %w", i+1, len(chunks), err),
+				})
+				return
+			}
+			duration, err := readDuration(outputPath)
+			if err != nil {
+				sendTrackResult(ctx, results, player.TrackResult{
+					Err: fmt.Errorf("inspect track %d of %d: %w", i+1, len(chunks), err),
+				})
+				return
+			}
+			if duration <= 0 {
+				sendTrackResult(ctx, results, player.TrackResult{
+					Err: fmt.Errorf("inspect track %d of %d: audio duration must be greater than zero", i+1, len(chunks)),
+				})
+				return
+			}
+			if !sendTrackResult(ctx, results, player.TrackResult{
+				Track: player.Track{Text: chunk, Path: outputPath, Duration: duration},
+			}) {
+				return
+			}
+		}
+	}()
+	return results, done
+}
+
+func sendTrackResult(ctx context.Context, results chan<- player.TrackResult, result player.TrackResult) bool {
+	select {
+	case results <- result:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func isCharacterDevice(value any) bool {

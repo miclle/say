@@ -32,6 +32,12 @@ type Track struct {
 	Duration time.Duration
 }
 
+// TrackResult carries one ordered prepared track or a producer failure.
+type TrackResult struct {
+	Track Track
+	Err   error
+}
+
 // Transport controls one active audio file.
 type Transport interface {
 	Load(path string) error
@@ -42,118 +48,138 @@ type Transport interface {
 	IsPlaying() bool
 }
 
-// View receives playback lifecycle and control events.
+// View receives preparation, playback, and control events.
 type View interface {
+	Prepared(prepared, total int) error
 	Start(total int) error
 	Speaking(index, total int, text string) error
 	Spoken(index, total int) error
 	Paused(index, total int) error
 	Resumed(index, total int) error
-	Seeked(index, total int, delta, position, duration time.Duration) error
+	Buffering(index, total int) error
+	Seeked(index, total int, delta, position, duration time.Duration, complete bool) error
 	Failed(index, total int, err error) error
 	Finish(total int) error
 }
 
-// Play renders and controls synthesized audio tracks.
-func Play(ctx context.Context, tracks []Track, transport Transport, commands <-chan Command, view View) error {
+// Play renders and controls an ordered stream of synthesized audio tracks.
+func Play(ctx context.Context, total int, results <-chan TrackResult, transport Transport, commands <-chan Command, view View) error {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
-	return play(ctx, tracks, transport, commands, view, ticker.C)
+	return playStream(ctx, total, results, transport, commands, view, ticker.C)
 }
 
-func play(ctx context.Context, tracks []Track, transport Transport, commands <-chan Command, view View, ticks <-chan time.Time) error {
-	if err := validate(ctx, tracks, transport, view); err != nil {
+type pendingSeek struct {
+	target time.Duration
+	delta  time.Duration
+}
+
+type streamPlayer struct {
+	total      int
+	results    <-chan TrackResult
+	transport  Transport
+	commands   <-chan Command
+	view       View
+	ticks      <-chan time.Time
+	tracks     []Track
+	offsets    []time.Duration
+	current    int
+	playing    bool
+	active     bool
+	spoken     bool
+	waiting    bool
+	streamDone bool
+	pending    *pendingSeek
+}
+
+func playStream(ctx context.Context, total int, results <-chan TrackResult, transport Transport, commands <-chan Command, view View, ticks <-chan time.Time) error {
+	if err := validateStream(ctx, total, results, transport, view); err != nil {
 		return err
 	}
-
-	total := len(tracks)
-	offsets := make([]time.Duration, total+1)
-	for i, track := range tracks {
-		if track.Duration > time.Duration(1<<63-1)-offsets[i] {
-			return fmt.Errorf("total audio duration overflows")
-		}
-		offsets[i+1] = offsets[i] + track.Duration
-	}
-
-	if err := view.Start(total); err != nil {
-		return fmt.Errorf("render playback header: %w", err)
-	}
-	current := 0
-	playing := true
-	if err := activateTrack(transport, view, tracks, current, 0, playing); err != nil {
-		return reportFailure(view, current, total, err)
+	p := &streamPlayer{
+		total:     total,
+		results:   results,
+		transport: transport,
+		commands:  commands,
+		view:      view,
+		ticks:     ticks,
+		offsets:   []time.Duration{0},
+		current:   -1,
+		playing:   true,
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return reportFailure(view, current, total, ctx.Err())
-		case command, ok := <-commands:
+			if p.current < 0 {
+				return ctx.Err()
+			}
+			return reportFailure(view, p.current, total, ctx.Err())
+		case result, ok := <-p.results:
 			if !ok {
-				commands = nil
-				continue
-			}
-			switch command {
-			case Toggle:
-				if playing {
-					transport.Pause()
-					playing = false
-					if err := view.Paused(current, total); err != nil {
-						return fmt.Errorf("render paused state: %w", err)
+				if err := ctx.Err(); err != nil {
+					if p.current < 0 {
+						return err
 					}
-				} else {
-					if err := transport.Play(); err != nil {
-						return reportFailure(view, current, total, fmt.Errorf("resume track %d of %d: %w", current+1, total, err))
-					}
-					playing = true
-					if err := view.Resumed(current, total); err != nil {
-						return fmt.Errorf("render resumed state: %w", err)
-					}
+					return reportFailure(view, p.current, total, err)
 				}
-			case Backward, Forward:
-				delta := -seekStep
-				if command == Forward {
-					delta = seekStep
+				p.results = nil
+				p.streamDone = true
+				if len(p.tracks) != total {
+					return p.fail(fmt.Errorf("track stream prepared %d of %d tracks", len(p.tracks), total))
 				}
-				next, finished, err := seek(tracks, offsets, transport, view, current, playing, delta)
+				finished, err := p.resolveWait()
 				if err != nil {
-					return reportFailure(view, current, total, err)
+					return p.fail(err)
 				}
-				current = next
 				if finished {
-					if err := view.Spoken(current, total); err != nil {
-						return fmt.Errorf("render completion for track %d of %d: %w", current+1, total, err)
-					}
-					if err := view.Finish(total); err != nil {
-						return fmt.Errorf("render playback summary: %w", err)
-					}
-					return nil
+					return p.finish()
 				}
-			}
-		case <-ticks:
-			if !playing || transport.IsPlaying() {
 				continue
 			}
-			if err := view.Spoken(current, total); err != nil {
-				return fmt.Errorf("render completion for track %d of %d: %w", current+1, total, err)
+			if result.Err != nil {
+				return p.fail(result.Err)
 			}
-			if current == total-1 {
-				if err := view.Finish(total); err != nil {
-					return fmt.Errorf("render playback summary: %w", err)
-				}
-				return nil
+			finished, err := p.addTrack(result.Track)
+			if err != nil {
+				return p.fail(err)
 			}
-			current++
-			if err := activateTrack(transport, view, tracks, current, 0, true); err != nil {
-				return reportFailure(view, current, total, err)
+			if finished {
+				return p.finish()
+			}
+		case command, ok := <-p.commands:
+			if !ok {
+				p.commands = nil
+				continue
+			}
+			finished, err := p.handleCommand(command)
+			if err != nil {
+				return p.fail(err)
+			}
+			if finished {
+				return p.finish()
+			}
+		case <-p.ticks:
+			finished, err := p.handleTick()
+			if err != nil {
+				return p.fail(err)
+			}
+			if finished {
+				return p.finish()
 			}
 		}
 	}
 }
 
-func validate(ctx context.Context, tracks []Track, transport Transport, view View) error {
+func validateStream(ctx context.Context, total int, results <-chan TrackResult, transport Transport, view View) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if total <= 0 {
+		return fmt.Errorf("total tracks must be greater than zero")
+	}
+	if results == nil {
+		return fmt.Errorf("track result stream is required")
 	}
 	if transport == nil {
 		return fmt.Errorf("audio transport is required")
@@ -161,90 +187,285 @@ func validate(ctx context.Context, tracks []Track, transport Transport, view Vie
 	if view == nil {
 		return fmt.Errorf("view is required")
 	}
-	if len(tracks) == 0 {
-		return fmt.Errorf("at least one audio track is required")
-	}
-	for i, track := range tracks {
-		if strings.TrimSpace(track.Text) == "" {
-			return fmt.Errorf("track %d text is empty", i+1)
-		}
-		if strings.TrimSpace(track.Path) == "" {
-			return fmt.Errorf("track %d path is empty", i+1)
-		}
-		if track.Duration <= 0 {
-			return fmt.Errorf("track %d duration must be greater than zero", i+1)
-		}
-	}
 	return nil
 }
 
-func activateTrack(transport Transport, view View, tracks []Track, index int, position time.Duration, playing bool) error {
-	if err := transport.Load(tracks[index].Path); err != nil {
-		return fmt.Errorf("load track %d of %d: %w", index+1, len(tracks), err)
+func (p *streamPlayer) addTrack(track Track) (bool, error) {
+	index := len(p.tracks)
+	if index >= p.total {
+		return false, fmt.Errorf("track stream produced more than %d tracks", p.total)
 	}
-	if err := view.Speaking(index, len(tracks), tracks[index].Text); err != nil {
-		return fmt.Errorf("render track %d of %d before playback: %w", index+1, len(tracks), err)
+	if err := validateTrack(track, index); err != nil {
+		return false, err
+	}
+	previous := p.offsets[len(p.offsets)-1]
+	if track.Duration > time.Duration(1<<63-1)-previous {
+		return false, fmt.Errorf("total audio duration overflows")
+	}
+	p.tracks = append(p.tracks, track)
+	p.offsets = append(p.offsets, previous+track.Duration)
+	if err := p.view.Prepared(len(p.tracks), p.total); err != nil {
+		return false, fmt.Errorf("render preparation progress: %w", err)
+	}
+
+	if p.current < 0 {
+		if err := p.view.Start(p.total); err != nil {
+			return false, fmt.Errorf("render playback header: %w", err)
+		}
+		p.current = 0
+		if err := p.activate(0, 0); err != nil {
+			return false, err
+		}
+		if !p.playing {
+			if err := p.view.Paused(p.current, p.total); err != nil {
+				return false, fmt.Errorf("render paused state: %w", err)
+			}
+		}
+		return false, nil
+	}
+	return p.resolveWait()
+}
+
+func (p *streamPlayer) resolveWait() (bool, error) {
+	if p.pending != nil {
+		complete := p.complete()
+		knownDuration := p.knownDuration()
+		if p.pending.target < knownDuration || complete {
+			target := p.pending.target
+			delta := p.pending.delta
+			p.pending = nil
+			return p.performSeek(target, delta, complete)
+		}
+	}
+	if p.waiting && p.current+1 < len(p.tracks) {
+		p.current++
+		p.waiting = false
+		p.spoken = false
+		if err := p.activate(p.current, 0); err != nil {
+			return false, err
+		}
+	}
+	if p.waiting && p.complete() && p.current == len(p.tracks)-1 {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (p *streamPlayer) handleCommand(command Command) (bool, error) {
+	if p.current < 0 {
+		if command == Toggle {
+			p.playing = !p.playing
+		}
+		return false, nil
+	}
+	switch command {
+	case Toggle:
+		if p.playing {
+			if p.active {
+				p.transport.Pause()
+			}
+			p.playing = false
+			if err := p.view.Paused(p.current, p.total); err != nil {
+				return false, fmt.Errorf("render paused state: %w", err)
+			}
+			return false, nil
+		}
+		p.playing = true
+		if p.active {
+			if err := p.transport.Play(); err != nil {
+				return false, fmt.Errorf("resume track %d of %d: %w", p.current+1, p.total, err)
+			}
+		}
+		if err := p.view.Resumed(p.current, p.total); err != nil {
+			return false, fmt.Errorf("render resumed state: %w", err)
+		}
+	case Backward, Forward:
+		delta := -seekStep
+		if command == Forward {
+			delta = seekStep
+		}
+		return p.requestSeek(delta)
+	}
+	return false, nil
+}
+
+func (p *streamPlayer) requestSeek(delta time.Duration) (bool, error) {
+	target := p.absolutePosition() + delta
+	if p.pending != nil {
+		target = p.pending.target + delta
+	}
+	if target < 0 {
+		target = 0
+	}
+	complete := p.complete()
+	if target < p.knownDuration() || complete {
+		p.pending = nil
+		return p.performSeek(target, delta, complete)
+	}
+
+	if p.active {
+		p.transport.Pause()
+		p.active = false
+	}
+	p.waiting = false
+	p.pending = &pendingSeek{target: target, delta: delta}
+	if err := p.view.Buffering(len(p.tracks), p.total); err != nil {
+		return false, fmt.Errorf("render buffering state: %w", err)
+	}
+	return false, nil
+}
+
+func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (bool, error) {
+	knownDuration := p.knownDuration()
+	if target >= knownDuration {
+		if !complete {
+			return false, fmt.Errorf("seek target exceeds prepared audio")
+		}
+		target = knownDuration
+		last := len(p.tracks) - 1
+		if p.active {
+			p.transport.Pause()
+		}
+		if p.current != last || !p.active {
+			p.current = last
+			if err := p.activateAt(p.current, p.tracks[last].Duration, false); err != nil {
+				return false, err
+			}
+		} else if err := p.transport.Seek(p.tracks[last].Duration); err != nil {
+			return false, fmt.Errorf("seek to document end: %w", err)
+		}
+		if err := p.view.Seeked(last, p.total, delta, target, knownDuration, true); err != nil {
+			return false, fmt.Errorf("render seek state: %w", err)
+		}
+		return true, nil
+	}
+
+	index := 0
+	for index+1 < len(p.offsets) && p.offsets[index+1] <= target {
+		index++
+	}
+	local := target - p.offsets[index]
+	if index != p.current || !p.active {
+		p.current = index
+		if err := p.activateAt(index, local, p.playing); err != nil {
+			return false, err
+		}
+	} else if err := p.transport.Seek(local); err != nil {
+		return false, fmt.Errorf("seek track %d of %d: %w", index+1, p.total, err)
+	}
+	p.active = true
+	p.waiting = false
+	p.spoken = false
+	if err := p.view.Seeked(index, p.total, delta, target, knownDuration, complete); err != nil {
+		return false, fmt.Errorf("render seek state: %w", err)
+	}
+	return false, nil
+}
+
+func (p *streamPlayer) handleTick() (bool, error) {
+	if p.current < 0 || !p.playing || !p.active || p.transport.IsPlaying() {
+		return false, nil
+	}
+	if !p.spoken {
+		if err := p.view.Spoken(p.current, p.total); err != nil {
+			return false, fmt.Errorf("render completion for track %d of %d: %w", p.current+1, p.total, err)
+		}
+		p.spoken = true
+	}
+	p.active = false
+	if p.current+1 < len(p.tracks) {
+		p.current++
+		p.spoken = false
+		if err := p.activate(p.current, 0); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if p.complete() {
+		return true, nil
+	}
+	if !p.waiting {
+		p.waiting = true
+		if err := p.view.Buffering(p.current+1, p.total); err != nil {
+			return false, fmt.Errorf("render buffering state: %w", err)
+		}
+	}
+	return false, nil
+}
+
+func (p *streamPlayer) activate(index int, position time.Duration) error {
+	return p.activateAt(index, position, p.playing)
+}
+
+func (p *streamPlayer) activateAt(index int, position time.Duration, shouldPlay bool) error {
+	track := p.tracks[index]
+	if err := p.transport.Load(track.Path); err != nil {
+		return fmt.Errorf("load track %d of %d: %w", index+1, p.total, err)
+	}
+	if err := p.view.Speaking(index, p.total, track.Text); err != nil {
+		return fmt.Errorf("render track %d of %d before playback: %w", index+1, p.total, err)
 	}
 	if position > 0 {
-		if err := transport.Seek(position); err != nil {
-			return fmt.Errorf("seek track %d of %d: %w", index+1, len(tracks), err)
+		if err := p.transport.Seek(position); err != nil {
+			return fmt.Errorf("seek track %d of %d: %w", index+1, p.total, err)
 		}
 	}
-	if playing {
-		if err := transport.Play(); err != nil {
-			return fmt.Errorf("play track %d of %d: %w", index+1, len(tracks), err)
+	if shouldPlay {
+		if err := p.transport.Play(); err != nil {
+			return fmt.Errorf("play track %d of %d: %w", index+1, p.total, err)
 		}
 	}
+	p.active = true
 	return nil
 }
 
-func seek(tracks []Track, offsets []time.Duration, transport Transport, view View, current int, playing bool, delta time.Duration) (int, bool, error) {
-	position := transport.Position()
+func (p *streamPlayer) absolutePosition() time.Duration {
+	if p.current < 0 {
+		return 0
+	}
+	position := p.transport.Position()
 	if position < 0 {
 		position = 0
 	}
-	if position > tracks[current].Duration {
-		position = tracks[current].Duration
+	if position > p.tracks[p.current].Duration {
+		position = p.tracks[p.current].Duration
 	}
-	absolute := offsets[current] + position + delta
-	if absolute < 0 {
-		absolute = 0
-	}
-	totalDuration := offsets[len(tracks)]
-	if absolute >= totalDuration {
-		last := len(tracks) - 1
-		if current != last {
-			if err := activateTrack(transport, view, tracks, last, tracks[last].Duration, false); err != nil {
-				return current, false, err
-			}
-		} else {
-			transport.Pause()
-			if err := transport.Seek(tracks[last].Duration); err != nil {
-				return current, false, fmt.Errorf("seek to document end: %w", err)
-			}
-		}
-		if err := view.Seeked(last, len(tracks), delta, totalDuration, totalDuration); err != nil {
-			return current, false, fmt.Errorf("render seek state: %w", err)
-		}
-		return last, true, nil
-	}
+	return p.offsets[p.current] + position
+}
 
-	target := 0
-	for target+1 < len(offsets) && offsets[target+1] <= absolute {
-		target++
+func (p *streamPlayer) knownDuration() time.Duration {
+	return p.offsets[len(p.offsets)-1]
+}
+
+func (p *streamPlayer) complete() bool {
+	return p.streamDone || len(p.tracks) == p.total
+}
+
+func (p *streamPlayer) fail(err error) error {
+	if p.current < 0 {
+		return err
 	}
-	local := absolute - offsets[target]
-	if target != current {
-		if err := activateTrack(transport, view, tracks, target, local, playing); err != nil {
-			return current, false, err
-		}
-	} else if err := transport.Seek(local); err != nil {
-		return current, false, fmt.Errorf("seek track %d of %d: %w", current+1, len(tracks), err)
+	return reportFailure(p.view, p.current, p.total, err)
+}
+
+func (p *streamPlayer) finish() error {
+	if err := p.view.Finish(p.total); err != nil {
+		return fmt.Errorf("render playback summary: %w", err)
 	}
-	if err := view.Seeked(target, len(tracks), delta, absolute, totalDuration); err != nil {
-		return current, false, fmt.Errorf("render seek state: %w", err)
+	return nil
+}
+
+func validateTrack(track Track, index int) error {
+	if strings.TrimSpace(track.Text) == "" {
+		return fmt.Errorf("track %d text is empty", index+1)
 	}
-	return target, false, nil
+	if strings.TrimSpace(track.Path) == "" {
+		return fmt.Errorf("track %d path is empty", index+1)
+	}
+	if track.Duration <= 0 {
+		return fmt.Errorf("track %d duration must be greater than zero", index+1)
+	}
+	return nil
 }
 
 func reportFailure(view View, index, total int, playbackErr error) error {

@@ -92,6 +92,11 @@ func New() (*Transport, error) {
 
 // Duration returns the playable duration of an audio file.
 func (t *Transport) Duration(path string) (time.Duration, error) {
+	return Duration(path)
+}
+
+// Duration returns the playable duration of an audio file without loading it for playback.
+func Duration(path string) (time.Duration, error) {
 	handle, err := createPlayer(path)
 	if err != nil {
 		return 0, err

@@ -20,7 +20,7 @@ func TestTransportLoadsPlaysPausesAndSeeks(t *testing.T) {
 	}
 	defer transport.Close()
 
-	duration, err := transport.Duration(path)
+	duration, err := Duration(path)
 	if err != nil {
 		t.Fatalf("Duration() error = %v", err)
 	}

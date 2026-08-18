@@ -25,6 +25,9 @@ func (t *Transport) Position() time.Duration                { return 0 }
 func (t *Transport) IsPlaying() bool                        { return false }
 func (t *Transport) Close() error                           { return nil }
 
+// Duration reports the native playback platform requirement.
+func Duration(string) (time.Duration, error) { return 0, unsupported() }
+
 func unsupported() error {
 	return fmt.Errorf("native audio playback requires macOS with cgo enabled")
 }

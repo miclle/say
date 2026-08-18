@@ -15,9 +15,10 @@ func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 	view.Start(2)
 	view.Speaking(0, 2, "第一句。")
 	view.Paused(0, 2)
-	view.Seeked(0, 2, -5*time.Second, 3*time.Second, 12*time.Second)
+	view.Seeked(0, 2, -5*time.Second, 3*time.Second, 12*time.Second, true)
 	view.Resumed(0, 2)
 	view.Spoken(0, 2)
+	view.Buffering(1, 2)
 	view.Speaking(1, 2, "Second.")
 	view.Failed(1, 2, errors.New("voice unavailable"))
 	view.Finish(2)
@@ -30,6 +31,7 @@ func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 		"      ↶ -5s · 00:03 / 00:12\n" +
 		"      ▶ resumed\n" +
 		"      ✓ played\n" +
+		"      … buffering speech unit 2/2\n" +
 		"[2/2] ▶ Second.\n" +
 		"      ✗ voice unavailable\n\n" +
 		"✓ Finished 2 speech units.\n"
@@ -57,12 +59,34 @@ func TestViewRendersPreparationOnce(t *testing.T) {
 	if err := view.Preparing(2); err != nil {
 		t.Fatalf("Preparing() error = %v", err)
 	}
+	if err := view.Prepared(1, 2); err != nil {
+		t.Fatalf("Prepared() error = %v", err)
+	}
 	if err := view.Start(2); err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
+	if err := view.Prepared(2, 2); err != nil {
+		t.Fatalf("Prepared() after Start() error = %v", err)
+	}
 
-	want := "say  notes.md\nTTS  test TTS · 2 speech units\n\n… preparing 2 audio tracks\nSpace 播放/暂停 · ← 回退 5s · → 快进 5s\n\n"
+	want := "say  notes.md\nTTS  test TTS · 2 speech units\n\n" +
+		"… preparing audio · 0/2 ready\n" +
+		"… ready to play · 1/2 prepared\n" +
+		"Space 播放/暂停 · ← 回退 5s · → 快进 5s\n\n"
 	if got := output.String(); got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestViewMarksIncompletePreparedDuration(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, false, "notes.md", "test TTS")
+
+	if err := view.Seeked(0, 3, 5*time.Second, 8*time.Second, 12*time.Second, false); err != nil {
+		t.Fatalf("Seeked() error = %v", err)
+	}
+
+	if got, want := output.String(), "      ↷ +5s · 00:08 / 00:12+\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
