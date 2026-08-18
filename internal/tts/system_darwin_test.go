@@ -82,6 +82,16 @@ func TestNewSystemRejectsNegativeRate(t *testing.T) {
 	}
 }
 
+func TestSystemSynthesizerUsesAIFFOutput(t *testing.T) {
+	synthesizer, err := NewSystem("", 0)
+	if err != nil {
+		t.Fatalf("NewSystem() error = %v", err)
+	}
+	if got, want := synthesizer.Extension(), ".aiff"; got != want {
+		t.Fatalf("Extension() = %q, want %q", got, want)
+	}
+}
+
 func TestSystemSynthesizerTerminatesProcessWhenCanceled(t *testing.T) {
 	dir := t.TempDir()
 	readyPath := filepath.Join(dir, "ready")

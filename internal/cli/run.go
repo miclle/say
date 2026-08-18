@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -20,7 +21,7 @@ import (
 
 const defaultMaxChars = 500
 
-type synthesizerFactory func(voice string, rate int) (tts.Synthesizer, error)
+type synthesizerFactory func(options tts.Options) (tts.Synthesizer, error)
 type transportFactory func() (audioTransport, error)
 type durationReader func(path string) (time.Duration, error)
 type terminalDetector func(value any) bool
@@ -44,7 +45,7 @@ type dependencies struct {
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return runWithDependencies(ctx, args, stdout, stderr, dependencies{
 		input:          os.Stdin,
-		newSynthesizer: tts.NewSystem,
+		newSynthesizer: tts.New,
 		newTransport: func() (audioTransport, error) {
 			return audio.New()
 		},
@@ -68,14 +69,16 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 
 	flags := flag.NewFlagSet("say", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	voice := flags.String("voice", "", "system voice name (default: System Settings)")
-	rate := flags.Int("rate", 0, "speech rate in words per minute (default: system rate)")
+	provider := flags.String("provider", string(tts.ProviderSystem), "TTS provider: system or edge")
+	voice := flags.String("voice", "", "provider voice name (default: provider voice)")
+	rate := flags.Int("rate", 0, "system speech rate in words per minute (default: system rate)")
+	speed := flags.Float64("speed", 1, "Edge TTS speed multiplier, from 0.5 to 2.0")
 	maxChars := flags.Int("max-chars", defaultMaxChars, "maximum Unicode characters per TTS call")
 	noColor := flags.Bool("no-color", false, "disable ANSI terminal colors")
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: say [flags] <document>")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Read a UTF-8 text document, print each speech unit, and play it with system TTS.")
+		fmt.Fprintln(stderr, "Read a UTF-8 text document, print each speech unit, and play it with TTS.")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Flags:")
 		flags.PrintDefaults()
@@ -87,12 +90,33 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		}
 		return 2
 	}
+	explicit := make(map[string]bool)
+	flags.Visit(func(flag *flag.Flag) {
+		explicit[flag.Name] = true
+	})
 	if *maxChars <= 0 {
 		fmt.Fprintln(stderr, "say: max-chars must be greater than zero")
 		return 2
 	}
 	if *rate < 0 {
 		fmt.Fprintln(stderr, "say: rate must not be negative")
+		return 2
+	}
+	selectedProvider := tts.Provider(*provider)
+	if selectedProvider != tts.ProviderSystem && selectedProvider != tts.ProviderEdge {
+		fmt.Fprintln(stderr, `say: provider must be "system" or "edge"`)
+		return 2
+	}
+	if selectedProvider == tts.ProviderEdge && explicit["rate"] {
+		fmt.Fprintln(stderr, "say: rate is only supported by the system provider")
+		return 2
+	}
+	if selectedProvider == tts.ProviderSystem && explicit["speed"] {
+		fmt.Fprintln(stderr, "say: speed is only supported by the edge provider")
+		return 2
+	}
+	if selectedProvider == tts.ProviderEdge && (math.IsNaN(*speed) || math.IsInf(*speed, 0) || *speed < 0.5 || *speed > 2) {
+		fmt.Fprintln(stderr, "say: speed must be between 0.5 and 2.0")
 		return 2
 	}
 	if flags.NArg() != 1 {
@@ -111,7 +135,13 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		fmt.Fprintf(stderr, "say: split document: %v\n", err)
 		return 1
 	}
-	synthesizer, err := deps.newSynthesizer(*voice, *rate)
+	options := tts.Options{Provider: selectedProvider, Voice: *voice}
+	if selectedProvider == tts.ProviderSystem {
+		options.Rate = *rate
+	} else {
+		options.Speed = *speed
+	}
+	synthesizer, err := deps.newSynthesizer(options)
 	if err != nil {
 		fmt.Fprintf(stderr, "say: initialize TTS: %v\n", err)
 		return 1
@@ -161,7 +191,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	cancelCommands()
 	restoreErr := restore()
 	if playbackErr != nil {
-		if errors.Is(playbackErr, context.Canceled) || errors.Is(playbackErr, context.DeadlineExceeded) {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(playbackErr, ctxErr) {
 			fmt.Fprintf(stderr, "say: playback interrupted: %v\n", playbackErr)
 			return 130
 		}
@@ -191,7 +221,7 @@ func prepareTracks(
 			if ctx.Err() != nil {
 				return
 			}
-			outputPath := filepath.Join(tempDir, fmt.Sprintf("%06d.aiff", i+1))
+			outputPath := filepath.Join(tempDir, fmt.Sprintf("%06d%s", i+1, synthesizer.Extension()))
 			if err := synthesizer.Synthesize(ctx, chunk, outputPath); err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return

@@ -28,8 +28,8 @@ func TestRunSynthesizesEveryBoundedChunkAndCleansTemporaryAudio(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
 	}
-	if synthesizer.voice != "" || synthesizer.rate != 0 {
-		t.Fatalf("synthesizer options = voice %q, rate %d; want system defaults", synthesizer.voice, synthesizer.rate)
+	if synthesizer.options.Provider != tts.ProviderSystem || synthesizer.options.Voice != "" || synthesizer.options.Rate != 0 {
+		t.Fatalf("synthesizer options = %#v; want system defaults", synthesizer.options)
 	}
 	if got := synthesizer.texts; len(got) != 2 || len([]rune(got[0])) != 500 || got[1] != "末" {
 		t.Fatalf("synthesized chunks = %#v, want lengths 500 and 1", got)
@@ -62,7 +62,7 @@ func TestRunStartsPlaybackBeforeSecondTrackFinishesSynthesis(t *testing.T) {
 	transport.playStarted = make(chan struct{})
 	deps := dependencies{
 		input: bytes.NewReader(nil),
-		newSynthesizer: func(string, int) (tts.Synthesizer, error) {
+		newSynthesizer: func(tts.Options) (tts.Synthesizer, error) {
 			return synthesizer, nil
 		},
 		newTransport:     func() (audioTransport, error) { return transport, nil },
@@ -112,11 +112,63 @@ func TestRunPassesVoiceRateAndCustomLimit(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
 	}
-	if synthesizer.voice != "Tingting" || synthesizer.rate != 210 {
-		t.Fatalf("synthesizer options = %q, %d", synthesizer.voice, synthesizer.rate)
+	if synthesizer.options.Voice != "Tingting" || synthesizer.options.Rate != 210 {
+		t.Fatalf("synthesizer options = %#v", synthesizer.options)
 	}
 	if got := synthesizer.texts; len(got) != 3 || got[0] != "1234" || got[1] != "5678" || got[2] != "9" {
 		t.Fatalf("synthesized chunks = %#v, want 4-rune chunks", got)
+	}
+}
+
+func TestRunPassesEdgeOptionsAndUsesMP3Tracks(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "hello")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	synthesizer.extension = ".mp3"
+	transport := newFakeAudio(&stdout, synthesizer)
+
+	code := runWithDependencies(
+		context.Background(),
+		[]string{"--no-color", "--provider", "edge", "--voice", "en-US-AriaNeural", "--speed", "1.25", path},
+		&stdout,
+		&stderr,
+		testDependencies(synthesizer, transport),
+	)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	if got, want := synthesizer.options, (tts.Options{Provider: tts.ProviderEdge, Voice: "en-US-AriaNeural", Speed: 1.25}); got != want {
+		t.Fatalf("synthesizer options = %#v, want %#v", got, want)
+	}
+	if len(synthesizer.paths) != 1 || filepath.Ext(synthesizer.paths[0]) != ".mp3" {
+		t.Fatalf("synthesized paths = %#v, want one MP3 path", synthesizer.paths)
+	}
+}
+
+func TestRunRejectsProviderSpecificFlagConflicts(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "hello")
+	for _, tt := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "unknown provider", args: []string{"--provider", "azure", path}, want: `provider must be "system" or "edge"`},
+		{name: "rate with edge", args: []string{"--provider", "edge", "--rate", "210", path}, want: "rate is only supported by the system provider"},
+		{name: "speed with system", args: []string{"--speed", "1.25", path}, want: "speed is only supported by the edge provider"},
+		{name: "edge speed below range", args: []string{"--provider", "edge", "--speed", "0.49", path}, want: "speed must be between 0.5 and 2.0"},
+		{name: "edge speed is not a number", args: []string{"--provider", "edge", "--speed", "NaN", path}, want: "speed must be between 0.5 and 2.0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			synthesizer := newFakeSynthesizer()
+			code := runWithDependencies(context.Background(), tt.args, &stdout, &stderr, testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer)))
+			if code != 2 || !strings.Contains(stderr.String(), tt.want) {
+				t.Fatalf("runWithDependencies() = %d, stderr = %q; want 2 containing %q", code, stderr.String(), tt.want)
+			}
+			if synthesizer.options != (tts.Options{}) {
+				t.Fatalf("synthesizer initialized for invalid options: %#v", synthesizer.options)
+			}
+		})
 	}
 }
 
@@ -174,6 +226,19 @@ func TestRunCleansTemporaryAudioAfterSynthesisFailure(t *testing.T) {
 	}
 }
 
+func TestRunTreatsProviderTimeoutAsPlaybackFailure(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "hello")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	synthesizer.failAt = 0
+	synthesizer.failure = context.DeadlineExceeded
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", path}, &stdout, &stderr, testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer)))
+	if code != 1 || !strings.Contains(stderr.String(), "playback failed") || strings.Contains(stderr.String(), "playback interrupted") {
+		t.Fatalf("runWithDependencies() = %d, stderr = %q; want provider failure with exit code 1", code, stderr.String())
+	}
+}
+
 func TestRunCancellationStopsPreparationBeforeCleanupAndRestoresTerminal(t *testing.T) {
 	path := writeDocument(t, "lesson.txt", "first paragraph\n\nsecond paragraph")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -184,7 +249,7 @@ func TestRunCancellationStopsPreparationBeforeCleanupAndRestoresTerminal(t *test
 	restored := false
 	deps := dependencies{
 		input: bytes.NewReader(nil),
-		newSynthesizer: func(string, int) (tts.Synthesizer, error) {
+		newSynthesizer: func(tts.Options) (tts.Synthesizer, error) {
 			return synthesizer, nil
 		},
 		newTransport: func() (audioTransport, error) { return transport, nil },
@@ -279,8 +344,8 @@ func TestRunReturns130WhenAlreadyCanceled(t *testing.T) {
 func testDependencies(synthesizer *fakeSynthesizer, transport *fakeAudio) dependencies {
 	return dependencies{
 		input: bytes.NewReader(nil),
-		newSynthesizer: func(voice string, rate int) (tts.Synthesizer, error) {
-			synthesizer.voice, synthesizer.rate = voice, rate
+		newSynthesizer: func(options tts.Options) (tts.Synthesizer, error) {
+			synthesizer.options = options
 			return synthesizer, nil
 		},
 		newTransport:     func() (audioTransport, error) { return transport, nil },
@@ -293,13 +358,14 @@ func testDependencies(synthesizer *fakeSynthesizer, transport *fakeAudio) depend
 }
 
 type fakeSynthesizer struct {
-	mu     sync.Mutex
-	voice  string
-	rate   int
-	texts  []string
-	paths  []string
-	byPath map[string]string
-	failAt int
+	mu        sync.Mutex
+	options   tts.Options
+	extension string
+	texts     []string
+	paths     []string
+	byPath    map[string]string
+	failAt    int
+	failure   error
 }
 
 type blockingSecondSynthesizer struct {
@@ -325,7 +391,8 @@ func newCancellationSynthesizer() *cancellationSynthesizer {
 	}
 }
 
-func (s *cancellationSynthesizer) Name() string { return "canceling test TTS" }
+func (s *cancellationSynthesizer) Name() string      { return "canceling test TTS" }
+func (s *cancellationSynthesizer) Extension() string { return ".aiff" }
 
 func (s *cancellationSynthesizer) Synthesize(ctx context.Context, text, outputPath string) error {
 	s.mu.Lock()
@@ -367,7 +434,8 @@ func newBlockingSecondSynthesizer() *blockingSecondSynthesizer {
 	}
 }
 
-func (s *blockingSecondSynthesizer) Name() string { return "blocking test TTS" }
+func (s *blockingSecondSynthesizer) Name() string      { return "blocking test TTS" }
+func (s *blockingSecondSynthesizer) Extension() string { return ".aiff" }
 
 func (s *blockingSecondSynthesizer) Synthesize(ctx context.Context, text, outputPath string) error {
 	s.mu.Lock()
@@ -386,10 +454,11 @@ func (s *blockingSecondSynthesizer) Synthesize(ctx context.Context, text, output
 }
 
 func newFakeSynthesizer() *fakeSynthesizer {
-	return &fakeSynthesizer{byPath: make(map[string]string), failAt: -1}
+	return &fakeSynthesizer{extension: ".aiff", byPath: make(map[string]string), failAt: -1}
 }
 
-func (s *fakeSynthesizer) Name() string { return "test TTS" }
+func (s *fakeSynthesizer) Name() string      { return "test TTS" }
+func (s *fakeSynthesizer) Extension() string { return s.extension }
 
 func (s *fakeSynthesizer) Synthesize(_ context.Context, text, outputPath string) error {
 	s.mu.Lock()
@@ -399,6 +468,9 @@ func (s *fakeSynthesizer) Synthesize(_ context.Context, text, outputPath string)
 	s.paths = append(s.paths, outputPath)
 	s.byPath[outputPath] = text
 	if index == s.failAt {
+		if s.failure != nil {
+			return s.failure
+		}
 		return fmt.Errorf("synthesis failed")
 	}
 	return os.WriteFile(outputPath, []byte("audio"), 0o600)

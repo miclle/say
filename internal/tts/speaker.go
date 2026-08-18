@@ -5,5 +5,6 @@ import "context"
 // Synthesizer converts one bounded text unit into an audio file.
 type Synthesizer interface {
 	Name() string
+	Extension() string
 	Synthesize(ctx context.Context, text, outputPath string) error
 }

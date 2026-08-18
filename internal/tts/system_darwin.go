@@ -38,6 +38,10 @@ func (s *systemSynthesizer) Name() string {
 	return fmt.Sprintf("macOS say (%s)", s.voice)
 }
 
+func (s *systemSynthesizer) Extension() string {
+	return ".aiff"
+}
+
 func (s *systemSynthesizer) Synthesize(ctx context.Context, text, outputPath string) error {
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("speech text is empty")
