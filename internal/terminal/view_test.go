@@ -95,6 +95,76 @@ func TestViewMovesPlaybackProgressWithinStableChapterList(t *testing.T) {
 	}
 }
 
+func TestViewPadsChapterNumbersToTotalWidth(t *testing.T) {
+	screen := newTestTerminalScreen()
+	screen.setSize(80, 30)
+	view := New(screen, false, "notes.md", "test TTS")
+	view.SetChapters([]string{
+		"One.", "Two.", "Three.", "Four.", "Five.", "Six.",
+		"Seven.", "Eight.", "Nine.", "Ten.", "Eleven.", "Twelve.",
+	})
+
+	view.Speaking(0, 12, "One.")
+
+	want := []string{
+		"[01/12] ▶ One.",
+		"[02/12] · Two.",
+		"[03/12] · Three.",
+		"[04/12] · Four.",
+		"[05/12] · Five.",
+		"[06/12] · Six.",
+		"[07/12] · Seven.",
+		"[08/12] · Eight.",
+		"[09/12] · Nine.",
+		"[10/12] · Ten.",
+		"[11/12] · Eleven.",
+		"[12/12] · Twelve.",
+	}
+	if got := screen.chapterLines(); !equalStrings(got, want) {
+		t.Fatalf("visible chapter lines = %#v, want %#v", got, want)
+	}
+}
+
+func TestViewWrapsChapterTextAfterPlaybackIcon(t *testing.T) {
+	screen := newTestTerminalScreen()
+	screen.setSize(18, 8)
+	view := New(screen, false, "notes.md", "test TTS")
+	view.SetChapters([]string{
+		"abcdefghijk", "Two.", "Three.", "Four.", "Five.", "Six.",
+		"Seven.", "Eight.", "Nine.", "Ten.", "Eleven.", "Twelve.",
+	})
+
+	view.Speaking(0, 12, "abcdefghijk")
+
+	want := []string{
+		"[01/12] ▶ abcdefgh",
+		"          ijk",
+	}
+	if got := screen.visibleLines(); !equalStrings(got, want) {
+		t.Fatalf("visible lines = %#v, want %#v", got, want)
+	}
+}
+
+func TestViewKeepsEmojiGraphemeTogetherWhenWrapping(t *testing.T) {
+	screen := newTestTerminalScreen()
+	screen.setSize(12, 8)
+	view := New(screen, false, "notes.md", "test TTS")
+	view.SetChapters([]string{
+		"👨‍👨‍👧A", "Two.", "Three.", "Four.", "Five.", "Six.",
+		"Seven.", "Eight.", "Nine.", "Ten.", "Eleven.", "Twelve.",
+	})
+
+	view.Speaking(0, 12, "👨‍👨‍👧A")
+
+	want := []string{
+		"[01/12] ▶ 👨‍👨‍👧",
+		"          A",
+	}
+	if got := screen.visibleLines(); !equalStrings(got, want) {
+		t.Fatalf("visible lines = %#v, want %#v", got, want)
+	}
+}
+
 func TestViewKeepsCompletedIconWhenResumingDuringBuffering(t *testing.T) {
 	screen := newTestTerminalScreen()
 	view := New(screen, false, "notes.md", "test TTS")
@@ -375,6 +445,17 @@ func (s *testTerminalScreen) chapterLines() []string {
 		}
 	}
 	return chapters
+}
+
+func (s *testTerminalScreen) visibleLines() []string {
+	var visible []string
+	for _, line := range s.lines {
+		text := strings.TrimRight(string(line), " ")
+		if text != "" {
+			visible = append(visible, text)
+		}
+	}
+	return visible
 }
 
 func equalStrings(left, right []string) bool {

@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/clipperhouse/uax29/v2/graphemes"
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
@@ -167,7 +169,7 @@ func (v *View) Speaking(index, total int, text string) error {
 		v.chapterStatus = ""
 		return v.renderChapters()
 	}
-	_, err := fmt.Fprintf(v.writer, "[%d/%d] %s %s\n", index+1, total, v.style(ansiCyan, "▶"), safe(text))
+	_, err := fmt.Fprintf(v.writer, "%s%s\n", speechPrefix(index, total, v.style(ansiCyan, "▶")), safe(text))
 	if err == nil {
 		v.current = &speechLine{index: index, total: total, text: text, rows: v.displayRows(speechText(index, total, "▶", text))}
 		v.rowsBelowCurrent = 0
@@ -307,11 +309,11 @@ func (v *View) renderChapters() error {
 	rows := 0
 	for index := start; index < end; index++ {
 		color, icon := v.chapterIcon(index)
-		plain := speechText(index, len(v.chapters), icon, v.chapters[index].text)
-		if _, err := fmt.Fprintf(v.writer, "[%d/%d] %s %s\n", index+1, len(v.chapters), v.style(color, icon), safe(v.chapters[index].text)); err != nil {
+		chapterRows, err := v.writeChapter(index, color, icon, v.chapters[index].text)
+		if err != nil {
 			return err
 		}
-		rows += v.displayRows(plain)
+		rows += chapterRows
 	}
 	if v.chapterStatus != "" {
 		if _, err := fmt.Fprintln(v.writer, "      "+v.chapterStatus); err != nil {
@@ -369,9 +371,9 @@ func (v *View) chapterRange() (int, int) {
 		budget = 1
 	}
 	start, end := active, active+1
-	used := v.displayRows(speechText(active, len(v.chapters), "▶", v.chapters[active].text))
+	used := v.chapterDisplayRows(active, "▶", v.chapters[active].text)
 	for start > 0 {
-		candidate := v.displayRows(speechText(start-1, len(v.chapters), "·", v.chapters[start-1].text))
+		candidate := v.chapterDisplayRows(start-1, "·", v.chapters[start-1].text)
 		if used+candidate > budget {
 			break
 		}
@@ -379,7 +381,7 @@ func (v *View) chapterRange() (int, int) {
 		used += candidate
 	}
 	for end < len(v.chapters) {
-		candidate := v.displayRows(speechText(end, len(v.chapters), "·", v.chapters[end].text))
+		candidate := v.chapterDisplayRows(end, "·", v.chapters[end].text)
 		if used+candidate > budget {
 			break
 		}
@@ -414,7 +416,7 @@ func (v *View) updateSpeechIcon(color, icon string) error {
 		return err
 	}
 	line := v.current
-	if _, err := fmt.Fprintf(v.writer, "[%d/%d] %s %s\n", line.index+1, line.total, v.style(color, icon), safe(line.text)); err != nil {
+	if _, err := fmt.Fprintf(v.writer, "%s%s\n", speechPrefix(line.index, line.total, v.style(color, icon)), safe(line.text)); err != nil {
 		return err
 	}
 	line.rows = v.displayRows(speechText(line.index, line.total, icon, line.text))
@@ -457,7 +459,7 @@ func (v *View) replaceSpeechLine(index, total int, text, color, icon string) err
 			return err
 		}
 	}
-	if _, err := fmt.Fprintf(v.writer, "[%d/%d] %s %s\n", index+1, total, v.style(color, icon), safe(text)); err != nil {
+	if _, err := fmt.Fprintf(v.writer, "%s%s\n", speechPrefix(index, total, v.style(color, icon)), safe(text)); err != nil {
 		return err
 	}
 	v.current = next
@@ -483,8 +485,85 @@ func (v *View) displayRows(text string) int {
 	return (columns-1)/v.width + 1
 }
 
+func (v *View) writeChapter(index int, color, icon, text string) (int, error) {
+	lines := v.chapterSpeechLines(index, icon, text)
+	plainPrefix := speechPrefix(index, len(v.chapters), icon)
+	styledPrefix := speechPrefix(index, len(v.chapters), v.style(color, icon))
+	rows := 0
+	for lineIndex, line := range lines {
+		rows += v.displayRows(line)
+		if lineIndex == 0 {
+			line = styledPrefix + strings.TrimPrefix(line, plainPrefix)
+		}
+		if _, err := fmt.Fprintln(v.writer, line); err != nil {
+			return 0, err
+		}
+	}
+	return rows, nil
+}
+
+func (v *View) chapterDisplayRows(index int, icon, text string) int {
+	rows := 0
+	for _, line := range v.chapterSpeechLines(index, icon, text) {
+		rows += v.displayRows(line)
+	}
+	return rows
+}
+
+func (v *View) chapterSpeechLines(index int, icon, text string) []string {
+	prefix := speechPrefix(index, len(v.chapters), icon)
+	escaped := safe(text)
+	contentWidth := v.width - runewidth.StringWidth(prefix)
+	if contentWidth <= 0 {
+		return []string{prefix + escaped}
+	}
+
+	chunks := wrapDisplayWidth(escaped, contentWidth)
+	lines := make([]string, len(chunks))
+	indent := strings.Repeat(" ", runewidth.StringWidth(prefix))
+	for chunkIndex, chunk := range chunks {
+		if chunkIndex == 0 {
+			lines[chunkIndex] = prefix + chunk
+			continue
+		}
+		lines[chunkIndex] = indent + chunk
+	}
+	return lines
+}
+
+func wrapDisplayWidth(text string, width int) []string {
+	if text == "" || width <= 0 {
+		return []string{text}
+	}
+
+	lines := make([]string, 0, (runewidth.StringWidth(text)+width-1)/width)
+	var line strings.Builder
+	lineWidth := 0
+	clusters := graphemes.FromString(text)
+	for clusters.Next() {
+		cluster := clusters.Value()
+		clusterWidth := runewidth.StringWidth(cluster)
+		if line.Len() > 0 && lineWidth+clusterWidth > width {
+			lines = append(lines, line.String())
+			line.Reset()
+			lineWidth = 0
+		}
+		line.WriteString(cluster)
+		lineWidth += clusterWidth
+	}
+	if line.Len() > 0 {
+		lines = append(lines, line.String())
+	}
+	return lines
+}
+
+func speechPrefix(index, total int, icon string) string {
+	digits := len(strconv.Itoa(total))
+	return fmt.Sprintf("[%0*d/%d] %s ", digits, index+1, total, icon)
+}
+
 func speechText(index, total int, icon, text string) string {
-	return fmt.Sprintf("[%d/%d] %s %s", index+1, total, icon, safe(text))
+	return speechPrefix(index, total, icon) + safe(text)
 }
 
 func unitWord(total int) string {
