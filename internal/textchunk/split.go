@@ -54,7 +54,7 @@ func splitParagraph(paragraph string, maxRunes int) []string {
 	}
 
 	var pieces []string
-	for _, sentence := range sentences(paragraph) {
+	for _, sentence := range Sentences(paragraph) {
 		pieces = append(pieces, limit(sentence, maxRunes)...)
 	}
 	return pack(pieces, maxRunes)
@@ -115,6 +115,11 @@ func sentences(text string) []string {
 	}
 	appendRange(len(runes))
 	return result
+}
+
+// Sentences splits text into normalized natural sentence units.
+func Sentences(text string) []string {
+	return sentences(text)
 }
 
 func isSentenceBoundary(runes []rune, index int) bool {

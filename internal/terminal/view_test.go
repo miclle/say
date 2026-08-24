@@ -45,7 +45,7 @@ func TestViewSeekReplacesCurrentSentenceWithoutAppending(t *testing.T) {
 	view := New(&output, false, "notes.md", "test TTS")
 	view.Speaking(0, 2, "First.")
 
-	if err := view.Seeked(1, 2, "Second.", true, 5*time.Second, 6*time.Second, 12*time.Second, true); err != nil {
+	if err := view.Seeked(1, 2, "Second.", 0, true, 5*time.Second, 6*time.Second, 12*time.Second, true); err != nil {
 		t.Fatalf("Seeked() error = %v", err)
 	}
 
@@ -61,7 +61,7 @@ func TestViewSeekKeepsPausedIcon(t *testing.T) {
 	view := New(&output, false, "notes.md", "test TTS")
 	view.Speaking(0, 2, "First.")
 
-	if err := view.Seeked(1, 2, "Second.", false, 5*time.Second, 6*time.Second, 12*time.Second, true); err != nil {
+	if err := view.Seeked(1, 2, "Second.", 0, false, 5*time.Second, 6*time.Second, 12*time.Second, true); err != nil {
 		t.Fatalf("Seeked() error = %v", err)
 	}
 
@@ -81,9 +81,9 @@ func TestViewMovesPlaybackProgressWithinStableChapterList(t *testing.T) {
 	view.Speaking(0, 3, "One.")
 	view.Spoken(0, 3)
 	view.Speaking(1, 3, "Two.")
-	view.Seeked(2, 3, "Three.", true, 5*time.Second, 7*time.Second, 12*time.Second, true)
-	view.Seeked(0, 3, "One.", true, -5*time.Second, 2*time.Second, 12*time.Second, true)
-	view.Seeked(2, 3, "Three.", true, 5*time.Second, 7*time.Second, 12*time.Second, true)
+	view.Seeked(2, 3, "Three.", 0, true, 5*time.Second, 7*time.Second, 12*time.Second, true)
+	view.Seeked(0, 3, "One.", 0, true, -5*time.Second, 2*time.Second, 12*time.Second, true)
+	view.Seeked(2, 3, "Three.", 0, true, 5*time.Second, 7*time.Second, 12*time.Second, true)
 
 	want := []string{
 		"[1/3] ✓ One.",
@@ -145,6 +145,98 @@ func TestViewHighlightsEveryWrappedLineOfActiveChapter(t *testing.T) {
 		if got := output.String(); !strings.Contains(got, want) {
 			t.Fatalf("wrapped output = %q, want highlighted chunk %q", got, want)
 		}
+	}
+}
+
+func TestViewHighlightsCurrentSentenceWithinActiveChapter(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"First sentence. Second sentence.", "Pending."})
+
+	view.Speaking(0, 2, "First sentence. Second sentence.")
+	if got := output.String(); !strings.Contains(got, "\x1b[7mFirst sentence.\x1b[0m") {
+		t.Fatalf("initial output = %q, want first sentence highlighted", got)
+	}
+	if got := output.String(); strings.Contains(got, "\x1b[7mSecond sentence.\x1b[0m") {
+		t.Fatalf("initial output = %q, second sentence must remain plain", got)
+	}
+
+	output.Reset()
+	view.Progress(0, 2, 1)
+	if got := output.String(); strings.Contains(got, "\x1b[7mFirst sentence.\x1b[0m") || !strings.Contains(got, "\x1b[7mSecond sentence.\x1b[0m") {
+		t.Fatalf("progress output = %q, want only second sentence highlighted", got)
+	}
+
+	output.Reset()
+	view.Paused(0, 2)
+	if got := output.String(); !strings.Contains(got, "\x1b[7mSecond sentence.\x1b[0m") {
+		t.Fatalf("paused output = %q, want second sentence highlight preserved", got)
+	}
+
+	output.Reset()
+	view.Spoken(0, 2)
+	if got := output.String(); strings.Contains(got, "\x1b[7m") {
+		t.Fatalf("completed output = %q, completed chapter must not stay highlighted", got)
+	}
+}
+
+func TestViewSentenceHighlightKeepsChapterLayoutStable(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"First. Second."})
+	view.Speaking(0, 1, "First. Second.")
+
+	output.Reset()
+	view.Progress(0, 1, 1)
+
+	if got := output.String(); !strings.Contains(got, "First. \x1b[7mSecond.\x1b[0m") {
+		t.Fatalf("progress output = %q, want sentence highlight without changing paragraph layout", got)
+	}
+}
+
+func TestViewSentenceProgressRedrawsOnlyAfterIndexChanges(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"First. Second."})
+	view.Speaking(0, 1, "First. Second.")
+
+	output.Reset()
+	view.Progress(0, 1, 0)
+	if got := output.String(); got != "" {
+		t.Fatalf("unchanged progress output = %q, want no redraw", got)
+	}
+
+	view.Progress(0, 1, 1)
+	if got := output.String(); !strings.Contains(got, "\x1b[7mSecond.\x1b[0m") {
+		t.Fatalf("changed progress output = %q, want second sentence highlighted", got)
+	}
+}
+
+func TestViewSeekResetsSentenceHighlightToChapterStart(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"First. Second."})
+	view.Speaking(0, 1, "First. Second.")
+	view.Progress(0, 1, 1)
+
+	output.Reset()
+	view.Seeked(0, 1, "First. Second.", 0, false, -5*time.Second, time.Second, 10*time.Second, true)
+	if got := output.String(); !strings.Contains(got, "\x1b[7mFirst.\x1b[0m") || strings.Contains(got, "\x1b[7mSecond.\x1b[0m") {
+		t.Fatalf("seek output = %q, want first sentence highlighted", got)
+	}
+}
+
+func TestViewSeekWithinCurrentSentenceKeepsHighlight(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"First. Second."})
+	view.Speaking(0, 1, "First. Second.")
+	view.Progress(0, 1, 1)
+
+	output.Reset()
+	view.Seeked(0, 1, "First. Second.", 1, false, 5*time.Second, 8*time.Second, 10*time.Second, true)
+	if got := output.String(); !strings.Contains(got, "\x1b[7mSecond.\x1b[0m") {
+		t.Fatalf("same-sentence seek output = %q, want second sentence highlight preserved", got)
 	}
 }
 

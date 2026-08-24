@@ -102,6 +102,101 @@ func TestPlayBuffersUntilNextStreamedTrackIsReady(t *testing.T) {
 	}
 }
 
+func TestPlayReportsSentenceProgressOnlyWhenSentenceChanges(t *testing.T) {
+	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 10 * time.Second})
+	view := &recordingView{events: &transport.events}
+	results := make(chan TrackResult)
+	ticks := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+
+	go func() {
+		done <- playStream(ctx, 1, results, transport, nil, view, ticks)
+	}()
+	results <- trackResult("First. Second.", "one.aiff", 10*time.Second)
+	transport.waitForEvent(t, "play:one.aiff")
+
+	transport.setPosition(6 * time.Second)
+	ticks <- time.Now()
+	transport.waitForEvent(t, "progress:0:1")
+	ticks <- time.Now()
+
+	if got := transport.countEvent("progress:"); got != 1 {
+		t.Fatalf("progress event count = %d, want 1 after sentence index stops changing", got)
+	}
+
+	cancel()
+	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("playStream() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestPlayPausedSeekSelectsEstimatedSentence(t *testing.T) {
+	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 10 * time.Second})
+	view := &recordingView{events: &transport.events}
+	results := make(chan TrackResult)
+	commands := make(chan Command)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+
+	go func() {
+		done <- playStream(ctx, 1, results, transport, commands, view, make(chan time.Time))
+	}()
+	results <- trackResult("First. Second.", "one.aiff", 10*time.Second)
+	transport.waitForEvent(t, "play:one.aiff")
+
+	transport.setPosition(time.Second)
+	commands <- Toggle
+	transport.waitForEvent(t, "paused:0")
+	commands <- Forward
+	transport.waitForEvent(t, "seek:one.aiff:6s")
+	transport.waitForEvent(t, "seeked:0:1:5s:6s:10s:true")
+
+	if transport.isPlaying() {
+		t.Fatal("paused sentence seek resumed playback")
+	}
+
+	cancel()
+	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("playStream() error = %v, want context.Canceled", err)
+	}
+	if got := transport.countEvent("progress:"); got != 0 {
+		t.Fatalf("progress event count = %d, want seek state rendered once by Seeked", got)
+	}
+}
+
+func TestPlayBackwardSeekSelectsFirstSentence(t *testing.T) {
+	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 10 * time.Second})
+	view := &recordingView{events: &transport.events}
+	results := make(chan TrackResult)
+	commands := make(chan Command)
+	ticks := make(chan time.Time)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+
+	go func() {
+		done <- playStream(ctx, 1, results, transport, commands, view, ticks)
+	}()
+	results <- trackResult("First. Second.", "one.aiff", 10*time.Second)
+	transport.waitForEvent(t, "play:one.aiff")
+	transport.setPosition(6 * time.Second)
+	ticks <- time.Now()
+	transport.waitForEvent(t, "progress:0:1")
+
+	commands <- Toggle
+	transport.waitForEvent(t, "paused:0")
+	commands <- Backward
+	transport.waitForEvent(t, "seeked:0:0:-5s:1s:10s:true")
+
+	cancel()
+	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("playStream() error = %v, want context.Canceled", err)
+	}
+	if got := transport.countEvent("progress:"); got != 1 {
+		t.Fatalf("progress event count = %d, want only the playback-tick update before seek", got)
+	}
+}
+
 func TestPlayForwardSeekWaitsForUnpreparedTrack(t *testing.T) {
 	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 4 * time.Second, "two.aiff": 8 * time.Second})
 	view := &recordingView{events: &transport.events}
@@ -119,9 +214,9 @@ func TestPlayForwardSeekWaitsForUnpreparedTrack(t *testing.T) {
 	commands <- Forward
 	results <- trackResult("second", "two.aiff", 8*time.Second)
 	transport.waitForEvent(t, "seek:two.aiff:2s")
-	transport.waitForEvent(t, "seeked:1:5s:6s:12s:true")
+	transport.waitForEvent(t, "seeked:1:0:5s:6s:12s:true")
 	events := transport.snapshot()
-	seekedAt := slices.Index(events, "seeked:1:5s:6s:12s:true")
+	seekedAt := slices.Index(events, "seeked:1:0:5s:6s:12s:true")
 	playAt := slices.Index(events, "play:two.aiff")
 	if seekedAt < 0 || playAt < 0 || seekedAt > playAt {
 		t.Fatalf("events = %#v, want seek target rendered before playback resumes", events)
@@ -193,10 +288,10 @@ func TestPlayBackwardSeekAcrossPreparedTracksIsImmediate(t *testing.T) {
 
 	transport.setPosition(3500 * time.Millisecond)
 	commands <- Forward
-	transport.waitForEvent(t, "seeked:1:5s:8.5s:12s:true")
+	transport.waitForEvent(t, "seeked:1:0:5s:8.5s:12s:true")
 	transport.setPosition(time.Second)
 	commands <- Backward
-	transport.waitForEvent(t, "seeked:0:-5s:0s:12s:true")
+	transport.waitForEvent(t, "seeked:0:0:-5s:0s:12s:true")
 	if got := transport.countEvent("speaking:"); got != 1 {
 		t.Fatalf("speaking event count = %d, want only the initial non-seek render", got)
 	}
@@ -442,6 +537,10 @@ func (v *recordingView) Speaking(index, _ int, text string) error {
 	v.events.add(fmt.Sprintf("speaking:%d:%s", index, text))
 	return nil
 }
+func (v *recordingView) Progress(index, _ int, sentence int) error {
+	v.events.add(fmt.Sprintf("progress:%d:%d", index, sentence))
+	return nil
+}
 func (v *recordingView) Spoken(index, _ int) error {
 	v.events.add(fmt.Sprintf("spoken:%d", index))
 	return nil
@@ -458,8 +557,8 @@ func (v *recordingView) Buffering(index, total int) error {
 	v.events.add(fmt.Sprintf("buffering:%d:%d", index, total))
 	return nil
 }
-func (v *recordingView) Seeked(index, _ int, _ string, _ bool, delta, position, duration time.Duration, complete bool) error {
-	v.events.add(fmt.Sprintf("seeked:%d:%s:%s:%s:%t", index, delta, position, duration, complete))
+func (v *recordingView) Seeked(index, _ int, _ string, sentence int, _ bool, delta, position, duration time.Duration, complete bool) error {
+	v.events.add(fmt.Sprintf("seeked:%d:%d:%s:%s:%s:%t", index, sentence, delta, position, duration, complete))
 	return nil
 }
 func (v *recordingView) Failed(index, _ int, err error) error {

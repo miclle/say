@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/miclle/say/internal/textchunk"
 )
 
 const (
@@ -53,11 +56,12 @@ type View interface {
 	Prepared(prepared, total int) error
 	Start(total int) error
 	Speaking(index, total int, text string) error
+	Progress(index, total, sentence int) error
 	Spoken(index, total int) error
 	Paused(index, total int) error
 	Resumed(index, total int) error
 	Buffering(index, total int) error
-	Seeked(index, total int, text string, playing bool, delta, position, duration time.Duration, complete bool) error
+	Seeked(index, total int, text string, sentence int, playing bool, delta, position, duration time.Duration, complete bool) error
 	Failed(index, total int, err error) error
 	Finish(total int) error
 }
@@ -75,21 +79,23 @@ type pendingSeek struct {
 }
 
 type streamPlayer struct {
-	total      int
-	results    <-chan TrackResult
-	transport  Transport
-	commands   <-chan Command
-	view       View
-	ticks      <-chan time.Time
-	tracks     []Track
-	offsets    []time.Duration
-	current    int
-	playing    bool
-	active     bool
-	spoken     bool
-	waiting    bool
-	streamDone bool
-	pending    *pendingSeek
+	total           int
+	results         <-chan TrackResult
+	transport       Transport
+	commands        <-chan Command
+	view            View
+	ticks           <-chan time.Time
+	tracks          []Track
+	sentences       [][]string
+	offsets         []time.Duration
+	current         int
+	currentSentence int
+	playing         bool
+	active          bool
+	spoken          bool
+	waiting         bool
+	streamDone      bool
+	pending         *pendingSeek
 }
 
 func playStream(ctx context.Context, total int, results <-chan TrackResult, transport Transport, commands <-chan Command, view View, ticks <-chan time.Time) error {
@@ -97,15 +103,16 @@ func playStream(ctx context.Context, total int, results <-chan TrackResult, tran
 		return err
 	}
 	p := &streamPlayer{
-		total:     total,
-		results:   results,
-		transport: transport,
-		commands:  commands,
-		view:      view,
-		ticks:     ticks,
-		offsets:   []time.Duration{0},
-		current:   -1,
-		playing:   true,
+		total:           total,
+		results:         results,
+		transport:       transport,
+		commands:        commands,
+		view:            view,
+		ticks:           ticks,
+		offsets:         []time.Duration{0},
+		current:         -1,
+		currentSentence: -1,
+		playing:         true,
 	}
 
 	for {
@@ -203,6 +210,7 @@ func (p *streamPlayer) addTrack(track Track) (bool, error) {
 		return false, fmt.Errorf("total audio duration overflows")
 	}
 	p.tracks = append(p.tracks, track)
+	p.sentences = append(p.sentences, textchunk.Sentences(track.Text))
 	p.offsets = append(p.offsets, previous+track.Duration)
 	if err := p.view.Prepared(len(p.tracks), p.total); err != nil {
 		return false, fmt.Errorf("render preparation progress: %w", err)
@@ -331,7 +339,8 @@ func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (
 		} else if err := p.transport.Seek(p.tracks[last].Duration); err != nil {
 			return false, fmt.Errorf("seek to document end: %w", err)
 		}
-		if err := p.view.Seeked(last, p.total, p.tracks[last].Text, p.playing, delta, target, knownDuration, true); err != nil {
+		p.currentSentence = estimatedSentence(p.sentences[last], p.tracks[last].Duration, p.tracks[last].Duration)
+		if err := p.view.Seeked(last, p.total, p.tracks[last].Text, p.currentSentence, p.playing, delta, target, knownDuration, true); err != nil {
 			return false, fmt.Errorf("render seek state: %w", err)
 		}
 		return true, nil
@@ -354,7 +363,9 @@ func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (
 	p.active = true
 	p.waiting = false
 	p.spoken = false
-	if err := p.view.Seeked(index, p.total, p.tracks[index].Text, p.playing, delta, target, knownDuration, complete); err != nil {
+	sentence := estimatedSentence(p.sentences[index], local, p.tracks[index].Duration)
+	p.currentSentence = sentence
+	if err := p.view.Seeked(index, p.total, p.tracks[index].Text, sentence, p.playing, delta, target, knownDuration, complete); err != nil {
 		return false, fmt.Errorf("render seek state: %w", err)
 	}
 	if activateTarget && p.playing {
@@ -366,14 +377,18 @@ func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (
 }
 
 func (p *streamPlayer) handleTick() (bool, error) {
-	if p.current < 0 || !p.playing || !p.active || p.transport.IsPlaying() {
+	if p.current < 0 || !p.playing || !p.active {
 		return false, nil
+	}
+	if p.transport.IsPlaying() {
+		return false, p.reportProgress()
 	}
 	if !p.spoken {
 		if err := p.view.Spoken(p.current, p.total); err != nil {
 			return false, fmt.Errorf("render completion for track %d of %d: %w", p.current+1, p.total, err)
 		}
 		p.spoken = true
+		p.currentSentence = -1
 	}
 	p.active = false
 	if p.current+1 < len(p.tracks) {
@@ -415,6 +430,7 @@ func (p *streamPlayer) activateAt(index int, position time.Duration, shouldPlay,
 			return fmt.Errorf("seek track %d of %d: %w", index+1, p.total, err)
 		}
 	}
+	p.currentSentence = estimatedSentence(p.sentences[index], position, track.Duration)
 	if shouldPlay {
 		if err := p.transport.Play(); err != nil {
 			return fmt.Errorf("play track %d of %d: %w", index+1, p.total, err)
@@ -422,6 +438,42 @@ func (p *streamPlayer) activateAt(index int, position time.Duration, shouldPlay,
 	}
 	p.active = true
 	return nil
+}
+
+func (p *streamPlayer) reportProgress() error {
+	track := p.tracks[p.current]
+	sentence := estimatedSentence(p.sentences[p.current], p.transport.Position(), track.Duration)
+	if sentence == p.currentSentence {
+		return nil
+	}
+	p.currentSentence = sentence
+	if err := p.view.Progress(p.current, p.total, sentence); err != nil {
+		return fmt.Errorf("render sentence progress for track %d of %d: %w", p.current+1, p.total, err)
+	}
+	return nil
+}
+
+func estimatedSentence(sentences []string, position, duration time.Duration) int {
+	if len(sentences) <= 1 || duration <= 0 || position <= 0 {
+		return 0
+	}
+	if position >= duration {
+		return len(sentences) - 1
+	}
+
+	total := 0
+	for _, sentence := range sentences {
+		total += max(1, utf8.RuneCountInString(sentence))
+	}
+	progress := float64(position) / float64(duration)
+	cumulative := 0
+	for index, sentence := range sentences {
+		cumulative += max(1, utf8.RuneCountInString(sentence))
+		if progress < float64(cumulative)/float64(total) {
+			return index
+		}
+	}
+	return len(sentences) - 1
 }
 
 func (p *streamPlayer) absolutePosition() time.Duration {

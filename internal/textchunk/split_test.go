@@ -7,6 +7,14 @@ import (
 	"unicode/utf8"
 )
 
+func TestSentencesReturnsNaturalSentenceUnits(t *testing.T) {
+	got := Sentences("第一句。第二句！ Dr. Smith stayed.")
+	want := []string{"第一句。", "第二句！", "Dr. Smith stayed."}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Sentences() = %#v, want %#v", got, want)
+	}
+}
+
 func TestSplitKeepsNaturalParagraphs(t *testing.T) {
 	got, err := Split("第一句。第二句。\n这一行仍属于同一自然段。\n\n  \n第三句。第四句。", 100)
 	if err != nil {

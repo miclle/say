@@ -10,6 +10,7 @@ import (
 
 	"github.com/clipperhouse/uax29/v2/graphemes"
 	"github.com/mattn/go-runewidth"
+	"github.com/miclle/say/internal/textchunk"
 	"golang.org/x/term"
 )
 
@@ -38,6 +39,7 @@ type View struct {
 	rowsBelowCurrent int
 	chapters         []chapterLine
 	activeChapter    int
+	activeSentence   int
 	activeComplete   bool
 	playing          bool
 	chapterRows      int
@@ -54,7 +56,18 @@ type speechLine struct {
 
 type chapterLine struct {
 	text      string
+	sentences []string
 	completed bool
+}
+
+type chapterTextLine struct {
+	prefix   string
+	segments []chapterTextSegment
+}
+
+type chapterTextSegment struct {
+	text     string
+	sentence int
 }
 
 type terminalSizer interface {
@@ -83,16 +96,17 @@ func New(writer io.Writer, color bool, title, engine string) *View {
 		}
 	}
 	return &View{
-		writer:        writer,
-		color:         color,
-		title:         title,
-		engine:        engine,
-		controls:      true,
-		width:         width,
-		height:        height,
-		activeChapter: -1,
-		playing:       true,
-		terminalSize:  size,
+		writer:         writer,
+		color:          color,
+		title:          title,
+		engine:         engine,
+		controls:       true,
+		width:          width,
+		height:         height,
+		activeChapter:  -1,
+		activeSentence: -1,
+		playing:        true,
+		terminalSize:   size,
 	}
 }
 
@@ -101,8 +115,10 @@ func (v *View) SetChapters(texts []string) {
 	v.chapters = make([]chapterLine, len(texts))
 	for index, text := range texts {
 		v.chapters[index].text = text
+		v.chapters[index].sentences = textchunk.Sentences(text)
 	}
 	v.activeChapter = -1
+	v.activeSentence = -1
 	v.activeComplete = false
 	v.chapterRows = 0
 	v.chapterStatus = ""
@@ -165,6 +181,7 @@ func (v *View) Speaking(index, total int, text string) error {
 	if v.chapterMode() {
 		v.setChapterText(index, text)
 		v.activeChapter = index
+		v.activeSentence = 0
 		v.activeComplete = false
 		v.playing = true
 		v.chapterStatus = ""
@@ -178,12 +195,27 @@ func (v *View) Speaking(index, total int, text string) error {
 	return err
 }
 
+// Progress moves the active highlight to one sentence within a chapter.
+func (v *View) Progress(index, _ int, sentence int) error {
+	if !v.chapterMode() {
+		return nil
+	}
+	sentence = v.validSentence(index, sentence)
+	if index == v.activeChapter && sentence == v.activeSentence {
+		return nil
+	}
+	v.activeChapter = index
+	v.activeSentence = sentence
+	return v.renderChapters()
+}
+
 func (v *View) Spoken(index, _ int) error {
 	if v.chapterMode() {
 		if index >= 0 && index < len(v.chapters) {
 			v.chapters[index].completed = true
 		}
 		v.activeChapter = index
+		v.activeSentence = -1
 		v.activeComplete = true
 		return v.renderChapters()
 	}
@@ -222,10 +254,11 @@ func (v *View) Buffering(index, total int) error {
 	return err
 }
 
-func (v *View) Seeked(index, total int, text string, playing bool, _ time.Duration, position, duration time.Duration, complete bool) error {
+func (v *View) Seeked(index, total int, text string, sentence int, playing bool, _ time.Duration, position, duration time.Duration, complete bool) error {
 	if v.chapterMode() {
 		v.setChapterText(index, text)
 		v.activeChapter = index
+		v.activeSentence = v.validSentence(index, sentence)
 		v.activeComplete = complete && position >= duration
 		v.playing = playing
 		v.chapterStatus = ""
@@ -276,7 +309,21 @@ func (v *View) chapterMode() bool {
 func (v *View) setChapterText(index int, text string) {
 	if index >= 0 && index < len(v.chapters) {
 		v.chapters[index].text = text
+		v.chapters[index].sentences = textchunk.Sentences(text)
 	}
+}
+
+func (v *View) validSentence(index, sentence int) int {
+	if index < 0 || index >= len(v.chapters) || len(v.chapters[index].sentences) == 0 {
+		return 0
+	}
+	if sentence < 0 {
+		return 0
+	}
+	if sentence >= len(v.chapters[index].sentences) {
+		return len(v.chapters[index].sentences) - 1
+	}
+	return sentence
 }
 
 func (v *View) renderChapters() error {
@@ -489,22 +536,23 @@ func (v *View) displayRows(text string) int {
 
 func (v *View) writeChapter(index int, color, icon, text string, highlight bool) (int, error) {
 	lines := v.chapterSpeechLines(index, icon, text)
-	plainPrefix := speechPrefix(index, len(v.chapters), icon)
 	styledPrefix := speechPrefix(index, len(v.chapters), v.style(color, icon))
-	indent := strings.Repeat(" ", runewidth.StringWidth(plainPrefix))
 	rows := 0
 	for lineIndex, line := range lines {
-		rows += v.displayRows(line)
+		rows += v.displayRows(line.prefix + plainChapterText(line.segments))
+		prefix := line.prefix
 		if lineIndex == 0 {
-			content := strings.TrimPrefix(line, plainPrefix)
-			if highlight {
-				content = v.style(ansiReverse, content)
-			}
-			line = styledPrefix + content
-		} else if highlight {
-			line = indent + v.style(ansiReverse, strings.TrimPrefix(line, indent))
+			prefix = styledPrefix
 		}
-		if _, err := fmt.Fprintln(v.writer, line); err != nil {
+		var content strings.Builder
+		for _, segment := range line.segments {
+			text := segment.text
+			if highlight && segment.sentence == v.activeSentence {
+				text = v.style(ansiReverse, text)
+			}
+			content.WriteString(text)
+		}
+		if _, err := fmt.Fprintln(v.writer, prefix+content.String()); err != nil {
 			return 0, err
 		}
 	}
@@ -514,56 +562,98 @@ func (v *View) writeChapter(index int, color, icon, text string, highlight bool)
 func (v *View) chapterDisplayRows(index int, icon, text string) int {
 	rows := 0
 	for _, line := range v.chapterSpeechLines(index, icon, text) {
-		rows += v.displayRows(line)
+		rows += v.displayRows(line.prefix + plainChapterText(line.segments))
 	}
 	return rows
 }
 
-func (v *View) chapterSpeechLines(index int, icon, text string) []string {
+func (v *View) chapterSpeechLines(index int, icon, text string) []chapterTextLine {
 	prefix := speechPrefix(index, len(v.chapters), icon)
-	escaped := safe(text)
-	contentWidth := v.width - runewidth.StringWidth(prefix)
-	if contentWidth <= 0 {
-		return []string{prefix + escaped}
-	}
-
-	chunks := wrapDisplayWidth(escaped, contentWidth)
-	lines := make([]string, len(chunks))
 	indent := strings.Repeat(" ", runewidth.StringWidth(prefix))
-	for chunkIndex, chunk := range chunks {
-		if chunkIndex == 0 {
-			lines[chunkIndex] = prefix + chunk
-			continue
+	contentWidth := v.width - runewidth.StringWidth(prefix)
+	sentences := textchunk.Sentences(text)
+	if index >= 0 && index < len(v.chapters) && len(v.chapters[index].sentences) > 0 {
+		sentences = v.chapters[index].sentences
+	}
+	wrapped := wrapChapterSegments(chapterSentenceSegments(text, sentences), contentWidth)
+	lines := make([]chapterTextLine, len(wrapped))
+	for lineIndex, segments := range wrapped {
+		linePrefix := indent
+		if lineIndex == 0 {
+			linePrefix = prefix
 		}
-		lines[chunkIndex] = indent + chunk
+		lines[lineIndex] = chapterTextLine{prefix: linePrefix, segments: segments}
 	}
 	return lines
 }
 
-func wrapDisplayWidth(text string, width int) []string {
-	if text == "" || width <= 0 {
-		return []string{text}
+func chapterSentenceSegments(text string, sentences []string) []chapterTextSegment {
+	if len(sentences) == 0 {
+		return []chapterTextSegment{{text: safe(text), sentence: 0}}
 	}
 
-	lines := make([]string, 0, (runewidth.StringWidth(text)+width-1)/width)
-	var line strings.Builder
-	lineWidth := 0
-	clusters := graphemes.FromString(text)
-	for clusters.Next() {
-		cluster := clusters.Value()
-		clusterWidth := runewidth.StringWidth(cluster)
-		if line.Len() > 0 && lineWidth+clusterWidth > width {
-			lines = append(lines, line.String())
-			line.Reset()
-			lineWidth = 0
+	segments := make([]chapterTextSegment, 0, len(sentences)*2+1)
+	cursor := 0
+	for sentenceIndex, sentence := range sentences {
+		offset := strings.Index(text[cursor:], sentence)
+		if offset < 0 {
+			return []chapterTextSegment{{text: safe(text), sentence: 0}}
 		}
-		line.WriteString(cluster)
-		lineWidth += clusterWidth
+		start := cursor + offset
+		if start > cursor {
+			appendChapterSegment(&segments, safe(text[cursor:start]), -1)
+		}
+		end := start + len(sentence)
+		appendChapterSegment(&segments, safe(text[start:end]), sentenceIndex)
+		cursor = end
 	}
-	if line.Len() > 0 {
-		lines = append(lines, line.String())
+	if cursor < len(text) {
+		appendChapterSegment(&segments, safe(text[cursor:]), -1)
+	}
+	return segments
+}
+
+func wrapChapterSegments(segments []chapterTextSegment, width int) [][]chapterTextSegment {
+	if width <= 0 {
+		return [][]chapterTextSegment{segments}
+	}
+
+	lines := [][]chapterTextSegment{{}}
+	lineWidth := 0
+	for _, segment := range segments {
+		clusters := graphemes.FromString(segment.text)
+		for clusters.Next() {
+			cluster := clusters.Value()
+			clusterWidth := runewidth.StringWidth(cluster)
+			if len(lines[len(lines)-1]) > 0 && lineWidth+clusterWidth > width {
+				lines = append(lines, nil)
+				lineWidth = 0
+			}
+			appendChapterSegment(&lines[len(lines)-1], cluster, segment.sentence)
+			lineWidth += clusterWidth
+		}
 	}
 	return lines
+}
+
+func appendChapterSegment(segments *[]chapterTextSegment, text string, sentence int) {
+	if text == "" {
+		return
+	}
+	last := len(*segments) - 1
+	if last >= 0 && (*segments)[last].sentence == sentence {
+		(*segments)[last].text += text
+		return
+	}
+	*segments = append(*segments, chapterTextSegment{text: text, sentence: sentence})
+}
+
+func plainChapterText(segments []chapterTextSegment) string {
+	var text strings.Builder
+	for _, segment := range segments {
+		text.WriteString(segment.text)
+	}
+	return text.String()
 }
 
 func speechPrefix(index, total int, icon string) string {
