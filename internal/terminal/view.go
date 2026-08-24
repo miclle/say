@@ -12,11 +12,12 @@ import (
 )
 
 const (
-	ansiReset = "\x1b[0m"
-	ansiBold  = "\x1b[1m"
-	ansiCyan  = "\x1b[36m"
-	ansiGreen = "\x1b[32m"
-	ansiRed   = "\x1b[31m"
+	ansiReset        = "\x1b[0m"
+	ansiBold         = "\x1b[1m"
+	ansiCyan         = "\x1b[36m"
+	ansiGreen        = "\x1b[32m"
+	ansiRed          = "\x1b[31m"
+	playbackControls = "Space Play/Pause · ← Back 5s · → Forward 5s"
 )
 
 // View renders terminal playback progress.
@@ -132,7 +133,7 @@ func (v *View) Start(total int) error {
 		return err
 	}
 	if v.controls {
-		if _, err := fmt.Fprintln(v.writer, "Space 播放/暂停 · ← 回退 5s · → 快进 5s"); err != nil {
+		if _, err := fmt.Fprintln(v.writer, playbackControls); err != nil {
 			return err
 		}
 	}
@@ -345,7 +346,7 @@ func (v *View) repaintTUI() error {
 	if _, err := fmt.Fprintf(v.writer, "%s  %s · %d speech %s\n\n", v.style(ansiCyan, "TTS"), safe(v.engine), len(v.chapters), unitWord(len(v.chapters))); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(v.writer, "Space 播放/暂停 · ← 回退 5s · → 快进 5s"); err != nil {
+	if _, err := fmt.Fprintln(v.writer, playbackControls); err != nil {
 		return err
 	}
 	if _, err := fmt.Fprintln(v.writer); err != nil {

@@ -24,6 +24,7 @@ const defaultMaxChars = 500
 type synthesizerFactory func(options tts.Options) (tts.Synthesizer, error)
 type transportFactory func() (audioTransport, error)
 type durationReader func(path string) (time.Duration, error)
+type documentReader func(ctx context.Context, source string, progress document.ProgressFunc) (name string, text string, err error)
 type terminalDetector func(value any) bool
 type rawInputFactory func(input io.Reader) (restore func() error, err error)
 type providerSelector func(ctx context.Context, input io.Reader, output io.Writer) (tts.Provider, error)
@@ -35,6 +36,7 @@ type audioTransport interface {
 
 type dependencies struct {
 	input            io.Reader
+	readDocument     documentReader
 	newSynthesizer   synthesizerFactory
 	newTransport     transportFactory
 	readDuration     durationReader
@@ -47,6 +49,7 @@ type dependencies struct {
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return runWithDependencies(ctx, args, stdout, stderr, dependencies{
 		input:          os.Stdin,
+		readDocument:   document.ReadSourceWithProgress,
 		newSynthesizer: tts.New,
 		newTransport: func() (audioTransport, error) {
 			return audio.New()
@@ -79,9 +82,9 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	maxChars := flags.Int("max-chars", defaultMaxChars, "maximum Unicode characters per TTS call")
 	noColor := flags.Bool("no-color", false, "disable ANSI terminal colors")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: say [flags] <document>")
+		fmt.Fprintln(stderr, "Usage: say [flags] <document-or-url>")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Read a UTF-8 text document, print each speech unit, and play it with TTS.")
+		fmt.Fprintln(stderr, "Read a local UTF-8 document or HTTP(S) web article, print each speech unit, and play it with TTS.")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Flags:")
 		flags.PrintDefaults()
@@ -106,11 +109,12 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		return 2
 	}
 	if flags.NArg() != 1 {
-		fmt.Fprintln(stderr, "say: exactly one document path is required")
+		fmt.Fprintln(stderr, "say: exactly one document path or web URL is required")
 		flags.Usage()
 		return 2
 	}
-	interactive := deps.supportsTerminal(deps.input) && deps.supportsTerminal(stdout)
+	terminalOutput := deps.supportsTerminal(stdout)
+	interactive := deps.supportsTerminal(deps.input) && terminalOutput
 	selectedProvider := tts.ProviderSystem
 	if explicit["provider"] {
 		selectedProvider = tts.Provider(*provider)
@@ -122,8 +126,12 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		}
 	}
 
-	title, text, err := document.Read(flags.Arg(0))
+	title, text, err := readDocumentWithLoading(ctx, flags.Arg(0), stdout, !*noColor && terminalOutput, terminalOutput, deps.readDocument)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+			fmt.Fprintf(stderr, "say: source loading interrupted: %v\n", err)
+			return 130
+		}
 		fmt.Fprintf(stderr, "say: %v\n", err)
 		return 1
 	}
@@ -169,7 +177,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		return 1
 	}
 
-	view := terminal.New(stdout, !*noColor && deps.supportsTerminal(stdout), title, synthesizer.Name())
+	view := terminal.New(stdout, !*noColor && terminalOutput, title, synthesizer.Name())
 	view.SetChapters(chunks)
 	view.SetControls(interactive)
 	if err := view.Preparing(len(chunks)); err != nil {
@@ -225,6 +233,103 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		return 1
 	}
 	return 0
+}
+
+type documentResult struct {
+	name string
+	text string
+	err  error
+}
+
+func readDocumentWithLoading(
+	ctx context.Context,
+	source string,
+	output io.Writer,
+	color bool,
+	enabled bool,
+	read documentReader,
+) (name string, text string, err error) {
+	if !enabled {
+		name, text, err := read(ctx, source, nil)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", "", ctxErr
+		}
+		return name, text, err
+	}
+
+	loader := terminal.NewLoader(output, color, true)
+	if err := loader.Start("Reading content"); err != nil {
+		return "", "", fmt.Errorf("render source loading: %w", err)
+	}
+
+	readCtx, cancelRead := context.WithCancel(ctx)
+	defer cancelRead()
+	progress := make(chan document.Stage, 4)
+	result := make(chan documentResult, 1)
+	go func() {
+		name, text, err := read(readCtx, source, func(stage document.Stage) {
+			select {
+			case progress <- stage:
+			case <-readCtx.Done():
+			}
+		})
+		result <- documentResult{name: name, text: text, err: err}
+	}()
+
+	ticker := time.NewTicker(80 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case stage := <-progress:
+			if err := loader.Update(sourceStageMessage(stage)); err != nil {
+				cancelRead()
+				_ = loader.Finish()
+				return "", "", fmt.Errorf("render source loading: %w", err)
+			}
+		case <-ticker.C:
+			if err := loader.Advance(); err != nil {
+				cancelRead()
+				_ = loader.Finish()
+				return "", "", fmt.Errorf("render source loading: %w", err)
+			}
+		case loaded := <-result:
+			for {
+				select {
+				case stage := <-progress:
+					if err := loader.Update(sourceStageMessage(stage)); err != nil {
+						return "", "", fmt.Errorf("render source loading: %w", err)
+					}
+				default:
+					if err := loader.Finish(); err != nil {
+						return "", "", fmt.Errorf("render source loading: %w", err)
+					}
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return "", "", ctxErr
+					}
+					return loaded.name, loaded.text, loaded.err
+				}
+			}
+		case <-ctx.Done():
+			cancelRead()
+			_ = loader.Finish()
+			return "", "", ctx.Err()
+		}
+	}
+}
+
+func sourceStageMessage(stage document.Stage) string {
+	switch stage {
+	case document.StageReadingDocument:
+		return "Reading file"
+	case document.StageParsingDocument:
+		return "Parsing document"
+	case document.StageReadingWebPage:
+		return "Reading webpage"
+	case document.StageExtractingWebPage:
+		return "Extracting webpage content"
+	default:
+		return "Reading content"
+	}
 }
 
 func validateProviderFlags(provider tts.Provider, rate int, speed float64, explicit map[string]bool) error {

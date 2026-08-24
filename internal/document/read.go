@@ -8,8 +8,27 @@ import (
 	"unicode/utf8"
 )
 
+// Stage identifies one user-visible source loading phase.
+type Stage uint8
+
+// Source loading stages reported by ReadSourceWithProgress.
+const (
+	StageReadingDocument Stage = iota
+	StageParsingDocument
+	StageReadingWebPage
+	StageExtractingWebPage
+)
+
+// ProgressFunc receives source loading stage changes.
+type ProgressFunc func(Stage)
+
 // Read loads and validates a local UTF-8 text document.
 func Read(path string) (name string, text string, err error) {
+	return readLocal(path, nil)
+}
+
+func readLocal(path string, progress ProgressFunc) (name string, text string, err error) {
+	report(progress, StageReadingDocument)
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", "", fmt.Errorf("open document: %w", err)
@@ -30,6 +49,7 @@ func Read(path string) (name string, text string, err error) {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
 	if isMarkdownPath(path) {
+		report(progress, StageParsingDocument)
 		text = markdownToNarration(text)
 	}
 	if strings.TrimSpace(text) == "" {
@@ -37,6 +57,12 @@ func Read(path string) (name string, text string, err error) {
 	}
 
 	return filepath.Base(path), text, nil
+}
+
+func report(progress ProgressFunc, stage Stage) {
+	if progress != nil {
+		progress(stage)
+	}
 }
 
 func isMarkdownPath(path string) bool {

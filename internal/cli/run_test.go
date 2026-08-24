@@ -8,12 +8,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/miclle/say/internal/document"
 	"github.com/miclle/say/internal/player"
 	"github.com/miclle/say/internal/tts"
 )
@@ -50,8 +52,159 @@ func TestRunSynthesizesEveryBoundedChunkAndCleansTemporaryAudio(t *testing.T) {
 		!strings.Contains(stdout.String(), "✓ Finished 2 speech units.") {
 		t.Fatalf("stdout = %q, want preparation and completion", stdout.String())
 	}
-	if strings.Contains(stdout.String(), "Space 播放/暂停") {
+	if strings.Contains(stdout.String(), "Space Play/Pause") {
 		t.Fatalf("redirected output advertised unavailable controls: %q", stdout.String())
+	}
+}
+
+func TestRunReadsWebSourceBeforePlayback(t *testing.T) {
+	const source = "https://example.com/articles/readable"
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	transport := newFakeAudio(&stdout, synthesizer)
+	deps := testDependencies(synthesizer, transport)
+	deps.readDocument = func(ctx context.Context, gotSource string, _ document.ProgressFunc) (string, string, error) {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("document reader context error = %v", err)
+		}
+		if gotSource != source {
+			t.Fatalf("document reader source = %q, want %q", gotSource, source)
+		}
+		return "Readable article", "first paragraph\n\nsecond paragraph", nil
+	}
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", source}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	if got, want := synthesizer.texts, []string{"first paragraph", "second paragraph"}; !slices.Equal(got, want) {
+		t.Fatalf("synthesized texts = %#v, want %#v", got, want)
+	}
+	if !strings.Contains(stdout.String(), "say  Readable article") {
+		t.Fatalf("stdout = %q, want extracted article title", stdout.String())
+	}
+}
+
+func TestRunStopsBeforeTTSWhenWebSourceFails(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	deps := testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer))
+	deps.readDocument = func(context.Context, string, document.ProgressFunc) (string, string, error) {
+		return "", "", fmt.Errorf("fetch web page: HTTP 503 Service Unavailable")
+	}
+
+	code := runWithDependencies(context.Background(), []string{"https://example.com/article"}, &stdout, &stderr, deps)
+	if code != 1 || !strings.Contains(stderr.String(), "HTTP 503 Service Unavailable") {
+		t.Fatalf("runWithDependencies() = %d, stderr = %q; want source failure", code, stderr.String())
+	}
+	if synthesizer.options != (tts.Options{}) || len(synthesizer.texts) != 0 {
+		t.Fatalf("synthesizer initialized after source failure: options=%#v texts=%#v", synthesizer.options, synthesizer.texts)
+	}
+}
+
+func TestRunShowsSourceLoadingStagesOnTerminal(t *testing.T) {
+	const source = "https://example.com/articles/loading"
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	deps := testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer))
+	deps.supportsTerminal = func(value any) bool { return value == &stdout }
+	deps.readDocument = func(ctx context.Context, gotSource string, progress document.ProgressFunc) (string, string, error) {
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("document reader context error = %v", err)
+		}
+		if gotSource != source {
+			t.Fatalf("document reader source = %q, want %q", gotSource, source)
+		}
+		progress(document.StageReadingWebPage)
+		progress(document.StageExtractingWebPage)
+		return "Loading article", "readable paragraph", nil
+	}
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", source}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	output := stdout.String()
+	reading := strings.Index(output, "⠋ Reading webpage…")
+	extracting := strings.Index(output, "Extracting webpage content…")
+	header := strings.Index(output, "say  Loading article")
+	if reading < 0 || extracting <= reading || header <= extracting {
+		t.Fatalf("stdout = %q, want ordered reading, extraction, and playback UI", output)
+	}
+	if clear := strings.LastIndex(output[:header], "\r\x1b[2K"); clear < 0 {
+		t.Fatalf("stdout before header = %q, want cleared loading row", output[:header])
+	}
+}
+
+func TestRunHidesSourceLoadingWhenOutputIsRedirected(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	deps := testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer))
+	deps.readDocument = func(context.Context, string, document.ProgressFunc) (string, string, error) {
+		return "Redirected article", "readable paragraph", nil
+	}
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", "https://example.com/article"}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	if output := stdout.String(); strings.ContainsAny(output, "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏") ||
+		strings.Contains(output, "Reading webpage") || strings.Contains(output, "Extracting webpage") || strings.Contains(output, "\x1b[2K") {
+		t.Fatalf("redirected stdout = %q, want no loading UI", output)
+	}
+}
+
+func TestRunCancelsSourceLoadingAndClearsRow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	deps := testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer))
+	deps.supportsTerminal = func(value any) bool { return value == &stdout }
+	started := make(chan struct{})
+	deps.readDocument = func(ctx context.Context, _ string, progress document.ProgressFunc) (string, string, error) {
+		progress(document.StageReadingWebPage)
+		close(started)
+		<-ctx.Done()
+		return "", "", ctx.Err()
+	}
+	done := make(chan int, 1)
+
+	go func() {
+		done <- runWithDependencies(ctx, []string{"--no-color", "https://example.com/article"}, &stdout, &stderr, deps)
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("document reader did not start")
+	}
+	select {
+	case code := <-done:
+		if code != 130 {
+			t.Fatalf("runWithDependencies() code = %d, stderr = %q; want 130", code, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runWithDependencies() did not stop after cancellation")
+	}
+	if !strings.HasSuffix(stdout.String(), "\r\x1b[2K") {
+		t.Fatalf("stdout = %q, want loading row cleared", stdout.String())
+	}
+	if synthesizer.options != (tts.Options{}) {
+		t.Fatalf("synthesizer initialized after source cancellation: %#v", synthesizer.options)
+	}
+}
+
+func TestReadDocumentWithLoadingPrefersCancellationOverLateSuccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	read := func(context.Context, string, document.ProgressFunc) (string, string, error) {
+		cancel()
+		return "late title", "late text", nil
+	}
+
+	name, text, err := readDocumentWithLoading(ctx, "notes.txt", io.Discard, false, false, read)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("readDocumentWithLoading() = %q, %q, %v; want context.Canceled", name, text, err)
 	}
 }
 
@@ -62,7 +215,8 @@ func TestRunStartsPlaybackBeforeSecondTrackFinishesSynthesis(t *testing.T) {
 	transport := newFakeAudio(&stdout, nil)
 	transport.playStarted = make(chan struct{})
 	deps := dependencies{
-		input: bytes.NewReader(nil),
+		input:        bytes.NewReader(nil),
+		readDocument: document.ReadSourceWithProgress,
 		newSynthesizer: func(tts.Options) (tts.Synthesizer, error) {
 			return synthesizer, nil
 		},
@@ -316,7 +470,7 @@ func TestRunEnablesInteractiveShortcutsAndRestoresTerminal(t *testing.T) {
 	if !transport.hasEvent("pause") || !transport.hasEvent("seek:5s") || !transport.hasEvent("seek:0s") {
 		t.Fatalf("transport events = %#v, want pause and ±5s seeks", transport.snapshot())
 	}
-	if !strings.Contains(stdout.String(), "Space 播放/暂停 · ← 回退 5s · → 快进 5s") {
+	if !strings.Contains(stdout.String(), "Space Play/Pause · ← Back 5s · → Forward 5s") {
 		t.Fatalf("stdout = %q, want shortcut help", stdout.String())
 	}
 }
@@ -389,7 +543,8 @@ func TestRunCancellationStopsPreparationBeforeCleanupAndRestoresTerminal(t *test
 	transport := newFakeAudio(&stdout, nil)
 	restored := false
 	deps := dependencies{
-		input: bytes.NewReader(nil),
+		input:        bytes.NewReader(nil),
+		readDocument: document.ReadSourceWithProgress,
 		newSynthesizer: func(tts.Options) (tts.Synthesizer, error) {
 			return synthesizer, nil
 		},
@@ -452,7 +607,7 @@ func TestRunRejectsUsageAndDocumentErrors(t *testing.T) {
 		wantCode int
 		wantErr  string
 	}{
-		{name: "missing document argument", wantCode: 2, wantErr: "Usage: say [flags] <document>"},
+		{name: "missing source argument", wantCode: 2, wantErr: "Usage: say [flags] <document-or-url>"},
 		{name: "zero max chars", args: []string{"--max-chars", "0", "notes.txt"}, wantCode: 2, wantErr: "max-chars must be greater than zero"},
 		{name: "negative rate", args: []string{"--rate", "-1", "notes.txt"}, wantCode: 2, wantErr: "rate must not be negative"},
 		{name: "missing document", args: []string{"missing.txt"}, wantCode: 1, wantErr: "open document"},
@@ -479,8 +634,10 @@ func TestRunHelpDescribesInteractiveProviderSelection(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "interactive: choose; non-interactive: system") || strings.Contains(stderr.String(), `provider string\n\tTTS provider: system or edge (default "system")`) {
-		t.Fatalf("help output = %q, want interactive provider-selection guidance", stderr.String())
+	if !strings.Contains(stderr.String(), "interactive: choose; non-interactive: system") ||
+		!strings.Contains(stderr.String(), "local UTF-8 document or HTTP(S) web article") ||
+		strings.Contains(stderr.String(), `provider string\n\tTTS provider: system or edge (default "system")`) {
+		t.Fatalf("help output = %q, want source and provider-selection guidance", stderr.String())
 	}
 }
 
@@ -499,7 +656,8 @@ func TestRunReturns130WhenAlreadyCanceled(t *testing.T) {
 
 func testDependencies(synthesizer *fakeSynthesizer, transport *fakeAudio) dependencies {
 	return dependencies{
-		input: bytes.NewReader(nil),
+		input:        bytes.NewReader(nil),
+		readDocument: document.ReadSourceWithProgress,
 		newSynthesizer: func(options tts.Options) (tts.Synthesizer, error) {
 			synthesizer.options = options
 			return synthesizer, nil

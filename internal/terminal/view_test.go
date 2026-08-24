@@ -26,7 +26,7 @@ func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 
 	want := "say  lesson.txt\n" +
 		"TTS  macOS say (system voice) · 2 speech units\n\n" +
-		"Space 播放/暂停 · ← 回退 5s · → 快进 5s\n\n" +
+		"Space Play/Pause · ← Back 5s · → Forward 5s\n\n" +
 		"[1/2] ▶ 第一句。\n" +
 		"\x1b[1A\r\x1b[2K[1/2] ⏸ 第一句。\n" +
 		"\x1b[1A\r\x1b[2K[1/2] ▶ 第一句。\n" +
@@ -147,7 +147,7 @@ func TestViewWritesSentenceWhenSpeakingStarts(t *testing.T) {
 	view.Start(1)
 	view.Speaking(0, 1, "Visible before speech.")
 
-	if got := output.String(); got != "say  notes.md\nTTS  test TTS · 1 speech unit\n\nSpace 播放/暂停 · ← 回退 5s · → 快进 5s\n\n[1/1] ▶ Visible before speech.\n" {
+	if got := output.String(); got != "say  notes.md\nTTS  test TTS · 1 speech unit\n\nSpace Play/Pause · ← Back 5s · → Forward 5s\n\n[1/1] ▶ Visible before speech.\n" {
 		t.Fatalf("output after Speaking() = %q", got)
 	}
 }
@@ -203,7 +203,7 @@ func TestViewRendersPreparationOnce(t *testing.T) {
 	want := "say  notes.md\nTTS  test TTS · 2 speech units\n\n" +
 		"… preparing audio · 0/2 ready\n" +
 		"… ready to play · 1/2 prepared\n" +
-		"Space 播放/暂停 · ← 回退 5s · → 快进 5s\n\n"
+		"Space Play/Pause · ← Back 5s · → Forward 5s\n\n"
 	if got := output.String(); got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
