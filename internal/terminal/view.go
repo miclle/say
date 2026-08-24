@@ -201,7 +201,9 @@ func (v *View) Progress(index, _ int, sentence int) error {
 		return nil
 	}
 	sentence = v.validSentence(index, sentence)
-	if index == v.activeChapter && sentence == v.activeSentence {
+	hadStatus := v.chapterStatus != ""
+	v.chapterStatus = ""
+	if index == v.activeChapter && sentence == v.activeSentence && !hadStatus {
 		return nil
 	}
 	v.activeChapter = index

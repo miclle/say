@@ -102,8 +102,11 @@ func TestPlayBuffersUntilNextStreamedTrackIsReady(t *testing.T) {
 	}
 }
 
-func TestPlayReportsSentenceProgressOnlyWhenSentenceChanges(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 10 * time.Second})
+func TestPlayAdvancesSentenceOnlyWhenCurrentAudioFinishes(t *testing.T) {
+	transport := newFakeTransport(map[string]time.Duration{
+		"one-1.aiff": 4 * time.Second,
+		"one-2.aiff": 6 * time.Second,
+	})
 	view := &recordingView{events: &transport.events}
 	results := make(chan TrackResult)
 	ticks := make(chan time.Time)
@@ -113,16 +116,28 @@ func TestPlayReportsSentenceProgressOnlyWhenSentenceChanges(t *testing.T) {
 	go func() {
 		done <- playStream(ctx, 1, results, transport, nil, view, ticks)
 	}()
-	results <- trackResult("First. Second.", "one.aiff", 10*time.Second)
-	transport.waitForEvent(t, "play:one.aiff")
+	results <- sentenceTrackResult("First. Second.", []SentenceTrack{
+		{Path: "one-1.aiff", Duration: 4 * time.Second},
+		{Path: "one-2.aiff", Duration: 6 * time.Second},
+	})
+	transport.waitForEvent(t, "play:one-1.aiff")
 
-	transport.setPosition(6 * time.Second)
+	transport.setPosition(3500 * time.Millisecond)
+	ticks <- time.Now()
+	if got := transport.countEvent("progress:"); got != 0 {
+		t.Fatalf("progress event count = %d, want none while the first sentence audio is playing", got)
+	}
+
+	transport.finishCurrent()
 	ticks <- time.Now()
 	transport.waitForEvent(t, "progress:0:1")
-	ticks <- time.Now()
+	transport.waitForEvent(t, "play:one-2.aiff")
 
 	if got := transport.countEvent("progress:"); got != 1 {
-		t.Fatalf("progress event count = %d, want 1 after sentence index stops changing", got)
+		t.Fatalf("progress event count = %d, want one transition at the audio boundary", got)
+	}
+	if got := transport.countEvent("spoken:"); got != 0 {
+		t.Fatalf("spoken event count = %d, want chapter to remain active after its first sentence", got)
 	}
 
 	cancel()
@@ -131,8 +146,61 @@ func TestPlayReportsSentenceProgressOnlyWhenSentenceChanges(t *testing.T) {
 	}
 }
 
-func TestPlayPausedSeekSelectsEstimatedSentence(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 10 * time.Second})
+func TestPlayBuffersWithinChapterUntilNextSentenceIsReady(t *testing.T) {
+	transport := newFakeTransport(map[string]time.Duration{
+		"one-1.aiff": 4 * time.Second,
+		"one-2.aiff": 6 * time.Second,
+	})
+	view := &recordingView{events: &transport.events}
+	results := make(chan TrackResult)
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- playStream(context.Background(), 1, results, transport, nil, view, ticks)
+	}()
+	results <- TrackResult{Track: Track{
+		Text:      "First. Second.",
+		Sentences: []SentenceTrack{{Path: "one-1.aiff", Duration: 4 * time.Second}},
+		Duration:  4 * time.Second,
+		Complete:  false,
+	}}
+	transport.waitForEvent(t, "play:one-1.aiff")
+	transport.finishCurrent()
+	ticks <- time.Now()
+	transport.waitForEvent(t, "buffering:0:1")
+	if got := transport.countEvent("spoken:"); got != 0 {
+		t.Fatalf("spoken event count = %d, want incomplete chapter to remain active", got)
+	}
+
+	results <- TrackResult{Track: Track{
+		Text: "First. Second.",
+		Sentences: []SentenceTrack{
+			{Path: "one-1.aiff", Duration: 4 * time.Second},
+			{Path: "one-2.aiff", Duration: 6 * time.Second},
+		},
+		Duration: 10 * time.Second,
+		Complete: true,
+	}}
+	transport.waitForEvent(t, "progress:0:1")
+	transport.waitForEvent(t, "play:one-2.aiff")
+	close(results)
+	transport.finishCurrent()
+	ticks <- time.Now()
+
+	if err := waitResult(t, done); err != nil {
+		t.Fatalf("playStream() error = %v", err)
+	}
+	if got := transport.countEvent("prepared:"); got != 1 {
+		t.Fatalf("prepared event count = %d, want one logical chapter", got)
+	}
+}
+
+func TestPlayPausedSeekLoadsSentenceSegmentAtLocalPosition(t *testing.T) {
+	transport := newFakeTransport(map[string]time.Duration{
+		"one-1.aiff": 4 * time.Second,
+		"one-2.aiff": 6 * time.Second,
+	})
 	view := &recordingView{events: &transport.events}
 	results := make(chan TrackResult)
 	commands := make(chan Command)
@@ -142,14 +210,18 @@ func TestPlayPausedSeekSelectsEstimatedSentence(t *testing.T) {
 	go func() {
 		done <- playStream(ctx, 1, results, transport, commands, view, make(chan time.Time))
 	}()
-	results <- trackResult("First. Second.", "one.aiff", 10*time.Second)
-	transport.waitForEvent(t, "play:one.aiff")
+	results <- sentenceTrackResult("First. Second.", []SentenceTrack{
+		{Path: "one-1.aiff", Duration: 4 * time.Second},
+		{Path: "one-2.aiff", Duration: 6 * time.Second},
+	})
+	transport.waitForEvent(t, "play:one-1.aiff")
 
 	transport.setPosition(time.Second)
 	commands <- Toggle
 	transport.waitForEvent(t, "paused:0")
 	commands <- Forward
-	transport.waitForEvent(t, "seek:one.aiff:6s")
+	transport.waitForEvent(t, "load:one-2.aiff")
+	transport.waitForEvent(t, "seek:one-2.aiff:2s")
 	transport.waitForEvent(t, "seeked:0:1:5s:6s:10s:true")
 
 	if transport.isPlaying() {
@@ -165,8 +237,11 @@ func TestPlayPausedSeekSelectsEstimatedSentence(t *testing.T) {
 	}
 }
 
-func TestPlayBackwardSeekSelectsFirstSentence(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 10 * time.Second})
+func TestPlayBackwardSeekLoadsEarlierSentenceSegment(t *testing.T) {
+	transport := newFakeTransport(map[string]time.Duration{
+		"one-1.aiff": 4 * time.Second,
+		"one-2.aiff": 6 * time.Second,
+	})
 	view := &recordingView{events: &transport.events}
 	results := make(chan TrackResult)
 	commands := make(chan Command)
@@ -177,15 +252,21 @@ func TestPlayBackwardSeekSelectsFirstSentence(t *testing.T) {
 	go func() {
 		done <- playStream(ctx, 1, results, transport, commands, view, ticks)
 	}()
-	results <- trackResult("First. Second.", "one.aiff", 10*time.Second)
-	transport.waitForEvent(t, "play:one.aiff")
-	transport.setPosition(6 * time.Second)
+	results <- sentenceTrackResult("First. Second.", []SentenceTrack{
+		{Path: "one-1.aiff", Duration: 4 * time.Second},
+		{Path: "one-2.aiff", Duration: 6 * time.Second},
+	})
+	transport.waitForEvent(t, "play:one-1.aiff")
+	transport.finishCurrent()
 	ticks <- time.Now()
 	transport.waitForEvent(t, "progress:0:1")
+	transport.setPosition(2 * time.Second)
 
 	commands <- Toggle
 	transport.waitForEvent(t, "paused:0")
 	commands <- Backward
+	transport.waitForEvent(t, "load:one-1.aiff")
+	transport.waitForEvent(t, "seek:one-1.aiff:1s")
 	transport.waitForEvent(t, "seeked:0:0:-5s:1s:10s:true")
 
 	cancel()
@@ -382,7 +463,15 @@ func TestPlayRejectsInvalidStreamInputs(t *testing.T) {
 }
 
 func trackResult(text, path string, duration time.Duration) TrackResult {
-	return TrackResult{Track: Track{Text: text, Path: path, Duration: duration}}
+	return sentenceTrackResult(text, []SentenceTrack{{Path: path, Duration: duration}})
+}
+
+func sentenceTrackResult(text string, sentences []SentenceTrack) TrackResult {
+	duration := time.Duration(0)
+	for _, sentence := range sentences {
+		duration += sentence.Duration
+	}
+	return TrackResult{Track: Track{Text: text, Sentences: sentences, Duration: duration, Complete: true}}
 }
 
 func closedResults() <-chan TrackResult {

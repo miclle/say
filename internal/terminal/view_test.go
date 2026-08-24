@@ -331,6 +331,21 @@ func TestViewKeepsCompletedIconWhenResumingDuringBuffering(t *testing.T) {
 	}
 }
 
+func TestViewClearsBufferingWhenNextSentenceStarts(t *testing.T) {
+	screen := newTestTerminalScreen()
+	view := New(screen, false, "notes.md", "test TTS")
+	view.SetChapters([]string{"First sentence. Second sentence."})
+
+	view.Start(1)
+	view.Speaking(0, 1, "First sentence. Second sentence.")
+	view.Buffering(0, 1)
+	view.Progress(0, 1, 1)
+
+	if got := strings.Join(screen.visibleLines(), "\n"); strings.Contains(got, "buffering") {
+		t.Fatalf("visible output = %q, want buffering status cleared after sentence playback resumes", got)
+	}
+}
+
 func TestViewRepaintsChapterListAfterTerminalResize(t *testing.T) {
 	screen := newTestTerminalScreen()
 	screen.setSize(80, 24)

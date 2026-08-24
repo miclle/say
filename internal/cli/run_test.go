@@ -57,6 +57,64 @@ func TestRunSynthesizesEveryBoundedChunkAndCleansTemporaryAudio(t *testing.T) {
 	}
 }
 
+func TestPrepareTracksSynthesizesSentencesWithoutSplittingLogicalChapter(t *testing.T) {
+	tempDir := t.TempDir()
+	synthesizer := newFakeSynthesizer()
+	durations := []time.Duration{3 * time.Second, 7 * time.Second}
+	readDuration := func(path string) (time.Duration, error) {
+		for index, synthesizedPath := range synthesizer.paths {
+			if path == synthesizedPath {
+				return durations[index], nil
+			}
+		}
+		return 0, fmt.Errorf("unknown synthesized path %q", path)
+	}
+
+	results, done := prepareTracks(
+		context.Background(),
+		[]string{"First sentence. Second sentence."},
+		tempDir,
+		synthesizer,
+		readDuration,
+	)
+	var prepared []player.TrackResult
+	for result := range results {
+		prepared = append(prepared, result)
+	}
+	<-done
+
+	if got := len(prepared); got != 2 {
+		t.Fatalf("track update count = %d, want one update per sentence", got)
+	}
+	for _, result := range prepared {
+		if result.Err != nil {
+			t.Fatalf("prepareTracks() error = %v", result.Err)
+		}
+	}
+	first, result := prepared[0].Track, prepared[1].Track
+	if got, want := synthesizer.texts, []string{"First sentence.", "Second sentence."}; !slices.Equal(got, want) {
+		t.Fatalf("synthesized texts = %#v, want %#v", got, want)
+	}
+	if len(first.Sentences) != 1 || first.Complete {
+		t.Fatalf("first track update = %#v, want one playable incomplete sentence", first)
+	}
+	if result.Text != "First sentence. Second sentence." {
+		t.Fatalf("logical track text = %q", result.Text)
+	}
+	if got := len(result.Sentences); got != 2 {
+		t.Fatalf("sentence audio count = %d, want 2", got)
+	}
+	if got, want := filepath.Base(result.Sentences[0].Path), "000001-001.aiff"; got != want {
+		t.Fatalf("first sentence path = %q, want %q", got, want)
+	}
+	if got, want := filepath.Base(result.Sentences[1].Path), "000001-002.aiff"; got != want {
+		t.Fatalf("second sentence path = %q, want %q", got, want)
+	}
+	if result.Duration != 10*time.Second || !result.Complete {
+		t.Fatalf("final logical track = %#v, want complete 10s track", result)
+	}
+}
+
 func TestRunReadsWebSourceBeforePlayback(t *testing.T) {
 	const source = "https://example.com/articles/readable"
 	var stdout, stderr bytes.Buffer
@@ -208,8 +266,8 @@ func TestReadDocumentWithLoadingPrefersCancellationOverLateSuccess(t *testing.T)
 	}
 }
 
-func TestRunStartsPlaybackBeforeSecondTrackFinishesSynthesis(t *testing.T) {
-	path := writeDocument(t, "lesson.txt", "first paragraph\n\nsecond paragraph")
+func TestRunStartsFirstSentenceBeforeSecondSentenceFinishesSynthesis(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "First sentence. Second sentence.")
 	var stdout, stderr bytes.Buffer
 	synthesizer := newBlockingSecondSynthesizer()
 	transport := newFakeAudio(&stdout, nil)
@@ -243,7 +301,7 @@ func TestRunStartsPlaybackBeforeSecondTrackFinishesSynthesis(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 		close(synthesizer.releaseSecond)
 		<-done
-		t.Fatal("first track did not start before second synthesis completed")
+		t.Fatal("first sentence did not start before second sentence synthesis completed")
 	}
 	close(synthesizer.releaseSecond)
 	if code := <-done; code != 0 {

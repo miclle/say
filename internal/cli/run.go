@@ -376,33 +376,51 @@ func prepareTracks(
 			if ctx.Err() != nil {
 				return
 			}
-			outputPath := filepath.Join(tempDir, fmt.Sprintf("%06d%s", i+1, synthesizer.Extension()))
-			if err := synthesizer.Synthesize(ctx, chunk, outputPath); err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
+			texts := textchunk.Sentences(chunk)
+			sentences := make([]player.SentenceTrack, 0, len(texts))
+			totalDuration := time.Duration(0)
+			for sentenceIndex, sentenceText := range texts {
+				outputPath := filepath.Join(tempDir, fmt.Sprintf("%06d-%03d%s", i+1, sentenceIndex+1, synthesizer.Extension()))
+				if err := synthesizer.Synthesize(ctx, sentenceText, outputPath); err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return
+					}
+					sendTrackResult(ctx, results, player.TrackResult{
+						Err: fmt.Errorf("synthesize track %d of %d sentence %d of %d: %w", i+1, len(chunks), sentenceIndex+1, len(texts), err),
+					})
 					return
 				}
-				sendTrackResult(ctx, results, player.TrackResult{
-					Err: fmt.Errorf("synthesize track %d of %d: %w", i+1, len(chunks), err),
-				})
-				return
-			}
-			duration, err := readDuration(outputPath)
-			if err != nil {
-				sendTrackResult(ctx, results, player.TrackResult{
-					Err: fmt.Errorf("inspect track %d of %d: %w", i+1, len(chunks), err),
-				})
-				return
-			}
-			if duration <= 0 {
-				sendTrackResult(ctx, results, player.TrackResult{
-					Err: fmt.Errorf("inspect track %d of %d: audio duration must be greater than zero", i+1, len(chunks)),
-				})
-				return
-			}
-			if !sendTrackResult(ctx, results, player.TrackResult{
-				Track: player.Track{Text: chunk, Path: outputPath, Duration: duration},
-			}) {
-				return
+				duration, err := readDuration(outputPath)
+				if err != nil {
+					sendTrackResult(ctx, results, player.TrackResult{
+						Err: fmt.Errorf("inspect track %d of %d sentence %d of %d: %w", i+1, len(chunks), sentenceIndex+1, len(texts), err),
+					})
+					return
+				}
+				if duration <= 0 {
+					sendTrackResult(ctx, results, player.TrackResult{
+						Err: fmt.Errorf("inspect track %d of %d sentence %d of %d: audio duration must be greater than zero", i+1, len(chunks), sentenceIndex+1, len(texts)),
+					})
+					return
+				}
+				if duration > time.Duration(1<<63-1)-totalDuration {
+					sendTrackResult(ctx, results, player.TrackResult{
+						Err: fmt.Errorf("inspect track %d of %d: total sentence audio duration overflows", i+1, len(chunks)),
+					})
+					return
+				}
+				totalDuration += duration
+				sentences = append(sentences, player.SentenceTrack{Path: outputPath, Duration: duration})
+				if !sendTrackResult(ctx, results, player.TrackResult{
+					Track: player.Track{
+						Text:      chunk,
+						Sentences: append([]player.SentenceTrack(nil), sentences...),
+						Duration:  totalDuration,
+						Complete:  sentenceIndex == len(texts)-1,
+					},
+				}) {
+					return
+				}
 			}
 		}
 	}()

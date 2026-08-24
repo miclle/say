@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode/utf8"
-
-	"github.com/miclle/say/internal/textchunk"
 )
 
 const (
@@ -28,11 +25,18 @@ const (
 	Forward
 )
 
-// Track binds one displayed text unit to its synthesized audio file.
-type Track struct {
-	Text     string
+// SentenceTrack binds one displayed sentence to its synthesized audio file.
+type SentenceTrack struct {
 	Path     string
 	Duration time.Duration
+}
+
+// Track binds one displayed text unit to its ordered sentence audio files.
+type Track struct {
+	Text      string
+	Sentences []SentenceTrack
+	Duration  time.Duration
+	Complete  bool
 }
 
 // TrackResult carries one ordered prepared track or a producer failure.
@@ -86,7 +90,6 @@ type streamPlayer struct {
 	view            View
 	ticks           <-chan time.Time
 	tracks          []Track
-	sentences       [][]string
 	offsets         []time.Duration
 	current         int
 	currentSentence int
@@ -94,7 +97,6 @@ type streamPlayer struct {
 	active          bool
 	spoken          bool
 	waiting         bool
-	streamDone      bool
 	pending         *pendingSeek
 }
 
@@ -131,9 +133,11 @@ func playStream(ctx context.Context, total int, results <-chan TrackResult, tran
 					return reportFailure(view, p.current, total, err)
 				}
 				p.results = nil
-				p.streamDone = true
 				if len(p.tracks) != total {
 					return p.fail(fmt.Errorf("track stream prepared %d of %d tracks", len(p.tracks), total))
+				}
+				if !p.complete() {
+					return p.fail(fmt.Errorf("track stream closed before track %d sentence audio completed", len(p.tracks)))
 				}
 				finished, err := p.resolveWait()
 				if err != nil {
@@ -198,6 +202,9 @@ func validateStream(ctx context.Context, total int, results <-chan TrackResult, 
 }
 
 func (p *streamPlayer) addTrack(track Track) (bool, error) {
+	if len(p.tracks) > 0 && !p.tracks[len(p.tracks)-1].Complete {
+		return p.updateTrack(track)
+	}
 	index := len(p.tracks)
 	if index >= p.total {
 		return false, fmt.Errorf("track stream produced more than %d tracks", p.total)
@@ -210,7 +217,6 @@ func (p *streamPlayer) addTrack(track Track) (bool, error) {
 		return false, fmt.Errorf("total audio duration overflows")
 	}
 	p.tracks = append(p.tracks, track)
-	p.sentences = append(p.sentences, textchunk.Sentences(track.Text))
 	p.offsets = append(p.offsets, previous+track.Duration)
 	if err := p.view.Prepared(len(p.tracks), p.total); err != nil {
 		return false, fmt.Errorf("render preparation progress: %w", err)
@@ -234,6 +240,32 @@ func (p *streamPlayer) addTrack(track Track) (bool, error) {
 	return p.resolveWait()
 }
 
+func (p *streamPlayer) updateTrack(track Track) (bool, error) {
+	index := len(p.tracks) - 1
+	if err := validateTrack(track, index); err != nil {
+		return false, err
+	}
+	previous := p.tracks[index]
+	if track.Text != previous.Text {
+		return false, fmt.Errorf("track %d text changed while preparing sentence audio", index+1)
+	}
+	if len(track.Sentences) != len(previous.Sentences)+1 {
+		return false, fmt.Errorf("track %d sentence audio update has %d segments, want %d", index+1, len(track.Sentences), len(previous.Sentences)+1)
+	}
+	for sentenceIndex, sentence := range previous.Sentences {
+		if track.Sentences[sentenceIndex] != sentence {
+			return false, fmt.Errorf("track %d sentence %d changed while preparing audio", index+1, sentenceIndex+1)
+		}
+	}
+	base := p.offsets[index]
+	if track.Duration > time.Duration(1<<63-1)-base {
+		return false, fmt.Errorf("total audio duration overflows")
+	}
+	p.tracks[index] = track
+	p.offsets[index+1] = base + track.Duration
+	return p.resolveWait()
+}
+
 func (p *streamPlayer) resolveWait() (bool, error) {
 	if p.pending != nil {
 		complete := p.complete()
@@ -244,6 +276,13 @@ func (p *streamPlayer) resolveWait() (bool, error) {
 			p.pending = nil
 			return p.performSeek(target, delta, complete)
 		}
+	}
+	if p.waiting && !p.spoken && p.current >= 0 && p.currentSentence+1 < len(p.tracks[p.current].Sentences) {
+		p.waiting = false
+		if err := p.advanceSentence(); err != nil {
+			return false, err
+		}
+		return false, nil
 	}
 	if p.waiting && p.current+1 < len(p.tracks) {
 		p.current++
@@ -331,15 +370,16 @@ func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (
 		if p.active {
 			p.transport.Pause()
 		}
-		if p.current != last || !p.active {
+		lastSentence := len(p.tracks[last].Sentences) - 1
+		lastPosition := p.tracks[last].Sentences[lastSentence].Duration
+		if p.current != last || !p.active || p.currentSentence != lastSentence {
 			p.current = last
 			if err := p.activateAt(p.current, p.tracks[last].Duration, false, false); err != nil {
 				return false, err
 			}
-		} else if err := p.transport.Seek(p.tracks[last].Duration); err != nil {
+		} else if err := p.transport.Seek(lastPosition); err != nil {
 			return false, fmt.Errorf("seek to document end: %w", err)
 		}
-		p.currentSentence = estimatedSentence(p.sentences[last], p.tracks[last].Duration, p.tracks[last].Duration)
 		if err := p.view.Seeked(last, p.total, p.tracks[last].Text, p.currentSentence, p.playing, delta, target, knownDuration, true); err != nil {
 			return false, fmt.Errorf("render seek state: %w", err)
 		}
@@ -351,19 +391,19 @@ func (p *streamPlayer) performSeek(target, delta time.Duration, complete bool) (
 		index++
 	}
 	local := target - p.offsets[index]
-	activateTarget := index != p.current || !p.active
+	sentence, sentenceLocal := sentencePosition(p.tracks[index], local)
+	activateTarget := index != p.current || !p.active || sentence != p.currentSentence
 	if activateTarget {
 		p.current = index
 		if err := p.activateAt(index, local, false, false); err != nil {
 			return false, err
 		}
-	} else if err := p.transport.Seek(local); err != nil {
+	} else if err := p.transport.Seek(sentenceLocal); err != nil {
 		return false, fmt.Errorf("seek track %d of %d: %w", index+1, p.total, err)
 	}
 	p.active = true
 	p.waiting = false
 	p.spoken = false
-	sentence := estimatedSentence(p.sentences[index], local, p.tracks[index].Duration)
 	p.currentSentence = sentence
 	if err := p.view.Seeked(index, p.total, p.tracks[index].Text, sentence, p.playing, delta, target, knownDuration, complete); err != nil {
 		return false, fmt.Errorf("render seek state: %w", err)
@@ -381,7 +421,24 @@ func (p *streamPlayer) handleTick() (bool, error) {
 		return false, nil
 	}
 	if p.transport.IsPlaying() {
-		return false, p.reportProgress()
+		return false, nil
+	}
+	track := p.tracks[p.current]
+	if p.currentSentence+1 < len(track.Sentences) {
+		if err := p.advanceSentence(); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if !track.Complete {
+		p.active = false
+		if !p.waiting {
+			p.waiting = true
+			if err := p.view.Buffering(p.current, p.total); err != nil {
+				return false, fmt.Errorf("render buffering state: %w", err)
+			}
+		}
+		return false, nil
 	}
 	if !p.spoken {
 		if err := p.view.Spoken(p.current, p.total); err != nil {
@@ -411,83 +468,96 @@ func (p *streamPlayer) handleTick() (bool, error) {
 	return false, nil
 }
 
-func (p *streamPlayer) activate(index int, position time.Duration) error {
-	return p.activateAt(index, position, p.playing, true)
-}
-
-func (p *streamPlayer) activateAt(index int, position time.Duration, shouldPlay, render bool) error {
-	track := p.tracks[index]
-	if err := p.transport.Load(track.Path); err != nil {
-		return fmt.Errorf("load track %d of %d: %w", index+1, p.total, err)
+func (p *streamPlayer) advanceSentence() error {
+	p.currentSentence++
+	sentence := p.tracks[p.current].Sentences[p.currentSentence]
+	if err := p.transport.Load(sentence.Path); err != nil {
+		return fmt.Errorf("load sentence %d of track %d of %d: %w", p.currentSentence+1, p.current+1, p.total, err)
 	}
-	if render {
-		if err := p.view.Speaking(index, p.total, track.Text); err != nil {
-			return fmt.Errorf("render track %d of %d before playback: %w", index+1, p.total, err)
-		}
+	if err := p.view.Progress(p.current, p.total, p.currentSentence); err != nil {
+		return fmt.Errorf("render sentence progress for track %d of %d: %w", p.current+1, p.total, err)
 	}
-	if position > 0 {
-		if err := p.transport.Seek(position); err != nil {
-			return fmt.Errorf("seek track %d of %d: %w", index+1, p.total, err)
-		}
-	}
-	p.currentSentence = estimatedSentence(p.sentences[index], position, track.Duration)
-	if shouldPlay {
+	if p.playing {
 		if err := p.transport.Play(); err != nil {
-			return fmt.Errorf("play track %d of %d: %w", index+1, p.total, err)
+			return fmt.Errorf("play sentence %d of track %d of %d: %w", p.currentSentence+1, p.current+1, p.total, err)
 		}
 	}
 	p.active = true
 	return nil
 }
 
-func (p *streamPlayer) reportProgress() error {
-	track := p.tracks[p.current]
-	sentence := estimatedSentence(p.sentences[p.current], p.transport.Position(), track.Duration)
-	if sentence == p.currentSentence {
-		return nil
-	}
-	p.currentSentence = sentence
-	if err := p.view.Progress(p.current, p.total, sentence); err != nil {
-		return fmt.Errorf("render sentence progress for track %d of %d: %w", p.current+1, p.total, err)
-	}
-	return nil
+func (p *streamPlayer) activate(index int, position time.Duration) error {
+	return p.activateAt(index, position, p.playing, true)
 }
 
-func estimatedSentence(sentences []string, position, duration time.Duration) int {
-	if len(sentences) <= 1 || duration <= 0 || position <= 0 {
-		return 0
+func (p *streamPlayer) activateAt(index int, position time.Duration, shouldPlay, render bool) error {
+	track := p.tracks[index]
+	sentenceIndex, sentencePosition := sentencePosition(track, position)
+	sentence := track.Sentences[sentenceIndex]
+	if err := p.transport.Load(sentence.Path); err != nil {
+		return fmt.Errorf("load sentence %d of track %d of %d: %w", sentenceIndex+1, index+1, p.total, err)
 	}
-	if position >= duration {
-		return len(sentences) - 1
-	}
-
-	total := 0
-	for _, sentence := range sentences {
-		total += max(1, utf8.RuneCountInString(sentence))
-	}
-	progress := float64(position) / float64(duration)
-	cumulative := 0
-	for index, sentence := range sentences {
-		cumulative += max(1, utf8.RuneCountInString(sentence))
-		if progress < float64(cumulative)/float64(total) {
-			return index
+	if render {
+		if err := p.view.Speaking(index, p.total, track.Text); err != nil {
+			return fmt.Errorf("render track %d of %d before playback: %w", index+1, p.total, err)
 		}
 	}
-	return len(sentences) - 1
+	if sentencePosition > 0 {
+		if err := p.transport.Seek(sentencePosition); err != nil {
+			return fmt.Errorf("seek sentence %d of track %d of %d: %w", sentenceIndex+1, index+1, p.total, err)
+		}
+	}
+	p.currentSentence = sentenceIndex
+	if shouldPlay {
+		if err := p.transport.Play(); err != nil {
+			return fmt.Errorf("play sentence %d of track %d of %d: %w", sentenceIndex+1, index+1, p.total, err)
+		}
+	}
+	p.active = true
+	return nil
 }
-
 func (p *streamPlayer) absolutePosition() time.Duration {
 	if p.current < 0 {
 		return 0
 	}
+	if p.spoken {
+		return p.offsets[p.current+1]
+	}
+	if p.currentSentence < 0 || p.currentSentence >= len(p.tracks[p.current].Sentences) {
+		return p.offsets[p.current]
+	}
+	track := p.tracks[p.current]
+	sentence := track.Sentences[p.currentSentence]
 	position := p.transport.Position()
 	if position < 0 {
 		position = 0
 	}
-	if position > p.tracks[p.current].Duration {
-		position = p.tracks[p.current].Duration
+	if position > sentence.Duration {
+		position = sentence.Duration
+	}
+	for i := 0; i < p.currentSentence; i++ {
+		position += track.Sentences[i].Duration
 	}
 	return p.offsets[p.current] + position
+}
+
+func sentencePosition(track Track, position time.Duration) (int, time.Duration) {
+	if position < 0 {
+		position = 0
+	}
+	for index, sentence := range track.Sentences {
+		if index == len(track.Sentences)-1 {
+			if position > sentence.Duration {
+				position = sentence.Duration
+			}
+			return index, position
+		}
+		if position < sentence.Duration {
+			return index, position
+		}
+		position -= sentence.Duration
+	}
+	return 0, 0
 }
 
 func (p *streamPlayer) knownDuration() time.Duration {
@@ -495,7 +565,7 @@ func (p *streamPlayer) knownDuration() time.Duration {
 }
 
 func (p *streamPlayer) complete() bool {
-	return p.streamDone || len(p.tracks) == p.total
+	return len(p.tracks) == p.total && p.tracks[len(p.tracks)-1].Complete
 }
 
 func (p *streamPlayer) fail(err error) error {
@@ -516,11 +586,27 @@ func validateTrack(track Track, index int) error {
 	if strings.TrimSpace(track.Text) == "" {
 		return fmt.Errorf("track %d text is empty", index+1)
 	}
-	if strings.TrimSpace(track.Path) == "" {
-		return fmt.Errorf("track %d path is empty", index+1)
+	if len(track.Sentences) == 0 {
+		return fmt.Errorf("track %d has no sentence audio", index+1)
 	}
 	if track.Duration <= 0 {
 		return fmt.Errorf("track %d duration must be greater than zero", index+1)
+	}
+	total := time.Duration(0)
+	for sentenceIndex, sentence := range track.Sentences {
+		if strings.TrimSpace(sentence.Path) == "" {
+			return fmt.Errorf("track %d sentence %d path is empty", index+1, sentenceIndex+1)
+		}
+		if sentence.Duration <= 0 {
+			return fmt.Errorf("track %d sentence %d duration must be greater than zero", index+1, sentenceIndex+1)
+		}
+		if sentence.Duration > time.Duration(1<<63-1)-total {
+			return fmt.Errorf("track %d duration overflows", index+1)
+		}
+		total += sentence.Duration
+	}
+	if track.Duration != total {
+		return fmt.Errorf("track %d duration %s does not match sentence audio total %s", index+1, track.Duration, total)
 	}
 	return nil
 }
