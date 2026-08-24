@@ -16,6 +16,7 @@ import (
 const (
 	ansiReset        = "\x1b[0m"
 	ansiBold         = "\x1b[1m"
+	ansiReverse      = "\x1b[7m"
 	ansiCyan         = "\x1b[36m"
 	ansiGreen        = "\x1b[32m"
 	ansiRed          = "\x1b[31m"
@@ -309,7 +310,8 @@ func (v *View) renderChapters() error {
 	rows := 0
 	for index := start; index < end; index++ {
 		color, icon := v.chapterIcon(index)
-		chapterRows, err := v.writeChapter(index, color, icon, v.chapters[index].text)
+		highlight := index == v.activeChapter && !v.activeComplete
+		chapterRows, err := v.writeChapter(index, color, icon, v.chapters[index].text, highlight)
 		if err != nil {
 			return err
 		}
@@ -485,15 +487,22 @@ func (v *View) displayRows(text string) int {
 	return (columns-1)/v.width + 1
 }
 
-func (v *View) writeChapter(index int, color, icon, text string) (int, error) {
+func (v *View) writeChapter(index int, color, icon, text string, highlight bool) (int, error) {
 	lines := v.chapterSpeechLines(index, icon, text)
 	plainPrefix := speechPrefix(index, len(v.chapters), icon)
 	styledPrefix := speechPrefix(index, len(v.chapters), v.style(color, icon))
+	indent := strings.Repeat(" ", runewidth.StringWidth(plainPrefix))
 	rows := 0
 	for lineIndex, line := range lines {
 		rows += v.displayRows(line)
 		if lineIndex == 0 {
-			line = styledPrefix + strings.TrimPrefix(line, plainPrefix)
+			content := strings.TrimPrefix(line, plainPrefix)
+			if highlight {
+				content = v.style(ansiReverse, content)
+			}
+			line = styledPrefix + content
+		} else if highlight {
+			line = indent + v.style(ansiReverse, strings.TrimPrefix(line, indent))
 		}
 		if _, err := fmt.Fprintln(v.writer, line); err != nil {
 			return 0, err

@@ -95,6 +95,59 @@ func TestViewMovesPlaybackProgressWithinStableChapterList(t *testing.T) {
 	}
 }
 
+func TestViewHighlightsOnlyActiveChapterText(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"One.", "Two."})
+
+	view.Speaking(0, 2, "One.")
+	if got := output.String(); !strings.Contains(got, "\x1b[7mOne.\x1b[0m") {
+		t.Fatalf("speaking output = %q, want active chapter text in reverse video", got)
+	}
+	if got := output.String(); strings.Contains(got, "\x1b[7mTwo.\x1b[0m") {
+		t.Fatalf("speaking output = %q, pending chapter text must not be highlighted", got)
+	}
+
+	output.Reset()
+	view.Paused(0, 2)
+	if got := output.String(); !strings.Contains(got, "\x1b[7mOne.\x1b[0m") {
+		t.Fatalf("paused output = %q, want active chapter highlight to preserve position", got)
+	}
+
+	output.Reset()
+	view.Spoken(0, 2)
+	if got := output.String(); strings.Contains(got, "\x1b[7m") {
+		t.Fatalf("completed output = %q, completed chapter must not stay highlighted", got)
+	}
+
+	output.Reset()
+	plainView := New(&output, false, "notes.md", "test TTS")
+	plainView.SetChapters([]string{"Plain."})
+	plainView.Speaking(0, 1, "Plain.")
+	if got := output.String(); strings.Contains(got, "\x1b[7m") {
+		t.Fatalf("plain output = %q, no-color mode must not emit reverse video", got)
+	}
+}
+
+func TestViewHighlightsEveryWrappedLineOfActiveChapter(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.width = 14
+	view.SetChapters([]string{"abcdefgh", "Two."})
+
+	view.Speaking(0, 2, "abcdefgh")
+
+	wantHighlights := []string{
+		"\x1b[7mabcdef\x1b[0m",
+		"\x1b[7mgh\x1b[0m",
+	}
+	for _, want := range wantHighlights {
+		if got := output.String(); !strings.Contains(got, want) {
+			t.Fatalf("wrapped output = %q, want highlighted chunk %q", got, want)
+		}
+	}
+}
+
 func TestViewPadsChapterNumbersToTotalWidth(t *testing.T) {
 	screen := newTestTerminalScreen()
 	screen.setSize(80, 30)
