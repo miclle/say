@@ -10,7 +10,7 @@ import (
 
 // ReadCommands decodes supported key sequences until input ends or context is canceled.
 func ReadCommands(ctx context.Context, reader io.Reader) <-chan player.Command {
-	commands := make(chan player.Command)
+	commands := make(chan player.Command, 32)
 	go func() {
 		defer close(commands)
 		input := bufio.NewReader(reader)
@@ -38,6 +38,10 @@ func ReadCommands(ctx context.Context, reader io.Reader) <-chan player.Command {
 				}
 			case 2:
 				switch key {
+				case 'A':
+					command, emit = player.PreviousChapter, true
+				case 'B':
+					command, emit = player.NextChapter, true
 				case 'D':
 					command, emit = player.Backward, true
 				case 'C':

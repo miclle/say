@@ -10,7 +10,7 @@ import (
 )
 
 func TestReadCommandsDecodesSpaceAndArrowKeys(t *testing.T) {
-	input := &oneByteReader{reader: bytes.NewBufferString("x \x1b[D?\x1b[C \x1bOD\x1bOC")}
+	input := &oneByteReader{reader: bytes.NewBufferString("x \x1b[D?\x1b[C \x1bOD\x1bOC\x1b[A\x1b[B\x1bOA\x1bOB")}
 	var got []player.Command
 	for command := range ReadCommands(context.Background(), input) {
 		got = append(got, command)
@@ -22,6 +22,10 @@ func TestReadCommandsDecodesSpaceAndArrowKeys(t *testing.T) {
 		player.Toggle,
 		player.Backward,
 		player.Forward,
+		player.PreviousChapter,
+		player.NextChapter,
+		player.PreviousChapter,
+		player.NextChapter,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("commands = %#v, want %#v", got, want)

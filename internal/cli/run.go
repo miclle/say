@@ -215,7 +215,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 
 	preparationCtx, cancelPreparation := context.WithCancel(ctx)
 	results, preparationDone := prepareTracks(preparationCtx, chunks, tempDir, synthesizer, deps.readDuration)
-	playbackErr := player.Play(ctx, len(chunks), results, transport, commands, view)
+	playbackErr := player.Play(ctx, chunks, results, transport, commands, view)
 	cancelPreparation()
 	<-preparationDone
 	cancelCommands()

@@ -66,6 +66,14 @@ static void say_audio_pause(SayAudioPlayer handle) {
 	[(__bridge AVAudioPlayer *)handle pause];
 }
 
+static void say_audio_stop(SayAudioPlayer handle) {
+	[(__bridge AVAudioPlayer *)handle stop];
+}
+
+static int say_audio_prepare(SayAudioPlayer handle) {
+	return [(__bridge AVAudioPlayer *)handle prepareToPlay] ? 1 : 0;
+}
+
 static int say_audio_is_playing(SayAudioPlayer handle) {
 	return [(__bridge AVAudioPlayer *)handle isPlaying] ? 1 : 0;
 }
@@ -79,10 +87,18 @@ import (
 )
 
 const nativeErrorBufferSize = 1024
+const cachedPlayers = 8
+
+type cachedPlayer struct {
+	path   string
+	handle C.SayAudioPlayer
+}
 
 // Transport controls local audio files through macOS AVFoundation.
 type Transport struct {
 	handle C.SayAudioPlayer
+	// Recent immutable sentence files, ordered from least to most recently used.
+	cache []cachedPlayer
 }
 
 // New constructs an unloaded native audio transport.
@@ -107,12 +123,42 @@ func Duration(path string) (time.Duration, error) {
 
 // Load replaces the active file after validating the new file.
 func (t *Transport) Load(path string) error {
+	for index, entry := range t.cache {
+		if entry.path != path {
+			continue
+		}
+		if entry.handle != t.handle {
+			// Prepare the destination while the old sentence is still audible.
+			// Reserve pause for user-initiated pause/resume, not replacement.
+			C.say_audio_seek(entry.handle, 0)
+			if C.say_audio_prepare(entry.handle) == 0 {
+				return fmt.Errorf("prepare audio %q for playback", path)
+			}
+		}
+		if t.handle != nil {
+			C.say_audio_stop(t.handle)
+		}
+		if entry.handle == t.handle {
+			C.say_audio_seek(entry.handle, 0)
+		}
+		t.handle = entry.handle
+		copy(t.cache[index:], t.cache[index+1:])
+		t.cache[len(t.cache)-1] = entry
+		return nil
+	}
 	handle, err := createPlayer(path)
 	if err != nil {
 		return err
 	}
-	t.release()
+	if t.handle != nil {
+		C.say_audio_stop(t.handle)
+	}
 	t.handle = handle
+	t.cache = append(t.cache, cachedPlayer{path: path, handle: handle})
+	if len(t.cache) > cachedPlayers {
+		C.say_audio_destroy(t.cache[0].handle)
+		t.cache = t.cache[1:]
+	}
 	return nil
 }
 
@@ -170,11 +216,12 @@ func (t *Transport) Close() error {
 }
 
 func (t *Transport) release() {
-	if t.handle != nil {
-		C.say_audio_pause(t.handle)
-		C.say_audio_destroy(t.handle)
-		t.handle = nil
+	t.Pause()
+	for _, entry := range t.cache {
+		C.say_audio_destroy(entry.handle)
 	}
+	t.cache = nil
+	t.handle = nil
 }
 
 func createPlayer(path string) (C.SayAudioPlayer, error) {

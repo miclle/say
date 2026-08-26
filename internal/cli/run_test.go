@@ -518,7 +518,7 @@ func TestRunRejectsProviderSpecificFlagConflicts(t *testing.T) {
 }
 
 func TestRunEnablesInteractiveShortcutsAndRestoresTerminal(t *testing.T) {
-	path := writeDocument(t, "lesson.txt", "A paragraph long enough for seeking.")
+	path := writeDocument(t, "lesson.txt", "First sentence. Second sentence.")
 	var stdout, stderr bytes.Buffer
 	synthesizer := newFakeSynthesizer()
 	transport := newFakeAudio(&stdout, synthesizer)
@@ -545,10 +545,19 @@ func TestRunEnablesInteractiveShortcutsAndRestoresTerminal(t *testing.T) {
 	if !restored {
 		t.Fatal("terminal restore function was not called")
 	}
-	if !transport.hasEvent("pause") || !transport.hasEvent("seek:5s") || !transport.hasEvent("seek:0s") {
-		t.Fatalf("transport events = %#v, want pause and ±5s seeks", transport.snapshot())
+	loads := 0
+	for _, event := range transport.snapshot() {
+		if event == "load" {
+			loads++
+		}
+		if strings.HasPrefix(event, "seek:") {
+			t.Fatalf("sentence navigation sought into audio: %s", event)
+		}
 	}
-	if !strings.Contains(stdout.String(), "Space Play/Pause · ← Back 5s · → Forward 5s") {
+	if !transport.hasEvent("pause") || loads < 3 {
+		t.Fatalf("transport events = %#v, want pause and whole-sentence reloads", transport.snapshot())
+	}
+	if !strings.Contains(stdout.String(), "Space Play/Pause · ←/→ Sentence · ↑/↓ Chapter") {
 		t.Fatalf("stdout = %q, want shortcut help", stdout.String())
 	}
 }

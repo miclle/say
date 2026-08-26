@@ -21,7 +21,7 @@ const (
 	ansiCyan         = "\x1b[36m"
 	ansiGreen        = "\x1b[32m"
 	ansiRed          = "\x1b[31m"
-	playbackControls = "Space Play/Pause · ← Back 5s · → Forward 5s"
+	playbackControls = "Space Play/Pause · ←/→ Sentence · ↑/↓ Chapter"
 )
 
 // View renders terminal playback progress.
@@ -44,6 +44,7 @@ type View struct {
 	playing          bool
 	chapterRows      int
 	chapterStatus    string
+	chapterFrame     string
 	terminalSize     func() (int, int, error)
 }
 
@@ -122,6 +123,7 @@ func (v *View) SetChapters(texts []string) {
 	v.activeComplete = false
 	v.chapterRows = 0
 	v.chapterStatus = ""
+	v.chapterFrame = ""
 }
 
 // SetControls configures whether interactive shortcut help is rendered.
@@ -309,7 +311,7 @@ func (v *View) chapterMode() bool {
 }
 
 func (v *View) setChapterText(index int, text string) {
-	if index >= 0 && index < len(v.chapters) {
+	if index >= 0 && index < len(v.chapters) && v.chapters[index].text != text {
 		v.chapters[index].text = text
 		v.chapters[index].sentences = textchunk.Sentences(text)
 	}
@@ -335,44 +337,46 @@ func (v *View) renderChapters() error {
 		}
 	}
 	start, end := v.chapterRange()
-	if v.chapterRows > 0 {
-		if _, err := fmt.Fprintf(v.writer, "\x1b[%dA\r", v.chapterRows); err != nil {
-			return err
-		}
-		for row := 0; row < v.chapterRows; row++ {
-			if _, err := fmt.Fprint(v.writer, "\x1b[2K"); err != nil {
-				return err
-			}
-			if row+1 < v.chapterRows {
-				if _, err := fmt.Fprint(v.writer, "\x1b[1B\r"); err != nil {
-					return err
-				}
-			}
-		}
-		if v.chapterRows > 1 {
-			if _, err := fmt.Fprintf(v.writer, "\x1b[%dA\r", v.chapterRows-1); err != nil {
-				return err
-			}
-		}
-	}
-
+	var content strings.Builder
 	rows := 0
 	for index := start; index < end; index++ {
 		color, icon := v.chapterIcon(index)
 		highlight := index == v.activeChapter && !v.activeComplete
-		chapterRows, err := v.writeChapter(index, color, icon, v.chapters[index].text, highlight)
+		chapterRows, err := v.writeChapter(&content, index, color, icon, v.chapters[index].text, highlight)
 		if err != nil {
 			return err
 		}
 		rows += chapterRows
 	}
 	if v.chapterStatus != "" {
-		if _, err := fmt.Fprintln(v.writer, "      "+v.chapterStatus); err != nil {
-			return err
-		}
+		fmt.Fprintln(&content, "      "+v.chapterStatus)
 		rows += v.displayRows("      " + v.chapterStatus)
 	}
+	frame := content.String()
+	if frame == v.chapterFrame {
+		return nil
+	}
+	// Submit clearing and replacement together so the terminal never receives
+	// a separate empty chapter list between playback states.
+	var output strings.Builder
+	if v.chapterRows > 0 {
+		fmt.Fprintf(&output, "\x1b[%dA\r", v.chapterRows)
+		for row := 0; row < v.chapterRows; row++ {
+			output.WriteString("\x1b[2K")
+			if row+1 < v.chapterRows {
+				output.WriteString("\x1b[1B\r")
+			}
+		}
+		if v.chapterRows > 1 {
+			fmt.Fprintf(&output, "\x1b[%dA\r", v.chapterRows-1)
+		}
+	}
+	output.WriteString(frame)
+	if _, err := io.WriteString(v.writer, output.String()); err != nil {
+		return err
+	}
 	v.chapterRows = rows
+	v.chapterFrame = frame
 	return nil
 }
 
@@ -406,6 +410,7 @@ func (v *View) repaintTUI() error {
 		return err
 	}
 	v.chapterRows = 0
+	v.chapterFrame = ""
 	return nil
 }
 
@@ -536,7 +541,7 @@ func (v *View) displayRows(text string) int {
 	return (columns-1)/v.width + 1
 }
 
-func (v *View) writeChapter(index int, color, icon, text string, highlight bool) (int, error) {
+func (v *View) writeChapter(writer io.Writer, index int, color, icon, text string, highlight bool) (int, error) {
 	lines := v.chapterSpeechLines(index, icon, text)
 	styledPrefix := speechPrefix(index, len(v.chapters), v.style(color, icon))
 	rows := 0
@@ -554,7 +559,7 @@ func (v *View) writeChapter(index int, color, icon, text string, highlight bool)
 			}
 			content.WriteString(text)
 		}
-		if _, err := fmt.Fprintln(v.writer, prefix+content.String()); err != nil {
+		if _, err := fmt.Fprintln(writer, prefix+content.String()); err != nil {
 			return 0, err
 		}
 	}

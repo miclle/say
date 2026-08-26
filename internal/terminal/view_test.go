@@ -3,6 +3,7 @@ package terminal
 import (
 	"bytes"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"testing"
@@ -26,7 +27,7 @@ func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 
 	want := "say  lesson.txt\n" +
 		"TTS  macOS say (system voice) · 2 speech units\n\n" +
-		"Space Play/Pause · ← Back 5s · → Forward 5s\n\n" +
+		"Space Play/Pause · ←/→ Sentence · ↑/↓ Chapter\n\n" +
 		"[1/2] ▶ 第一句。\n" +
 		"\x1b[1A\r\x1b[2K[1/2] ⏸ 第一句。\n" +
 		"\x1b[1A\r\x1b[2K[1/2] ▶ 第一句。\n" +
@@ -240,6 +241,63 @@ func TestViewSeekWithinCurrentSentenceKeepsHighlight(t *testing.T) {
 	}
 }
 
+func TestViewSeekWithinSameSentenceDoesNotRedrawUnchangedFrame(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"First. Second."})
+	if err := view.Speaking(0, 1, "First. Second."); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := view.Seeked(0, 1, "First. Second.", 0, true, 5*time.Second, 6*time.Second, 20*time.Second, true); err != nil {
+		t.Fatal(err)
+	}
+	if output.Len() != 0 {
+		t.Fatal("same-sentence seek cleared and repainted unchanged chapter text")
+	}
+}
+
+func TestViewChapterUpdateWritesOneFrame(t *testing.T) {
+	output := &countingWriter{}
+	view := New(output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"First.", "Second."})
+	if err := view.Speaking(0, 2, "First."); err != nil {
+		t.Fatal(err)
+	}
+	output.writes = 0
+	if err := view.Seeked(1, 2, "Second.", 0, true, 0, 10*time.Second, 20*time.Second, true); err != nil {
+		t.Fatal(err)
+	}
+	if output.writes != 1 {
+		t.Fatalf("chapter update writes = %d, want one complete frame to avoid visible clearing", output.writes)
+	}
+}
+
+type countingWriter struct{ writes int }
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return len(p), nil
+}
+
+func BenchmarkViewSeek(b *testing.B) {
+	view := New(io.Discard, true, "notes.md", "test TTS")
+	chapters := make([]string, 200)
+	for i := range chapters {
+		chapters[i] = strings.Repeat("章节内容用于验证方向键跳转的显示开销。", 20)
+	}
+	view.SetChapters(chapters)
+	if err := view.Speaking(0, len(chapters), chapters[0]); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := view.Seeked(i%2, len(chapters), chapters[i%2], 0, true, 5*time.Second, time.Second, time.Hour, true); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestViewPadsChapterNumbersToTotalWidth(t *testing.T) {
 	screen := newTestTerminalScreen()
 	screen.setSize(80, 30)
@@ -377,7 +435,7 @@ func TestViewWritesSentenceWhenSpeakingStarts(t *testing.T) {
 	view.Start(1)
 	view.Speaking(0, 1, "Visible before speech.")
 
-	if got := output.String(); got != "say  notes.md\nTTS  test TTS · 1 speech unit\n\nSpace Play/Pause · ← Back 5s · → Forward 5s\n\n[1/1] ▶ Visible before speech.\n" {
+	if got := output.String(); got != "say  notes.md\nTTS  test TTS · 1 speech unit\n\nSpace Play/Pause · ←/→ Sentence · ↑/↓ Chapter\n\n[1/1] ▶ Visible before speech.\n" {
 		t.Fatalf("output after Speaking() = %q", got)
 	}
 }
@@ -433,7 +491,7 @@ func TestViewRendersPreparationOnce(t *testing.T) {
 	want := "say  notes.md\nTTS  test TTS · 2 speech units\n\n" +
 		"… preparing audio · 0/2 ready\n" +
 		"… ready to play · 1/2 prepared\n" +
-		"Space Play/Pause · ← Back 5s · → Forward 5s\n\n"
+		"Space Play/Pause · ←/→ Sentence · ↑/↓ Chapter\n\n"
 	if got := output.String(); got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
