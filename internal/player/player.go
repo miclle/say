@@ -10,55 +10,44 @@ import (
 	"github.com/miclle/say/internal/textchunk"
 )
 
-const pollInterval = 25 * time.Millisecond
+const (
+	pollInterval    = 25 * time.Millisecond
+	navigationDelay = 200 * time.Millisecond
+)
 
 // Command describes an interactive playback action.
 type Command uint8
 
 const (
-	// Toggle switches between playing and paused states.
+	// Toggle preserves the playhead while changing playback intent.
 	Toggle Command = iota + 1
-	// Backward jumps to the beginning of the previous sentence.
+	// Backward selects the previous sentence.
 	Backward
-	// Forward jumps to the beginning of the next sentence.
+	// Forward selects the next sentence.
 	Forward
-	// PreviousChapter jumps to the beginning of the previous chapter.
+	// PreviousChapter selects the start of the previous chapter.
 	PreviousChapter
-	// NextChapter jumps to the beginning of the next chapter.
+	// NextChapter selects the start of the next chapter.
 	NextChapter
 )
 
-// SentenceTrack binds one displayed sentence to its synthesized audio file.
+// SentenceTrack binds a source sentence to its synthesized audio.
 type SentenceTrack struct {
 	Path     string
 	Duration time.Duration
 }
 
-// Track binds one displayed text unit to its ordered sentence audio files.
-type Track struct {
-	Text      string
-	Sentences []SentenceTrack
-	Duration  time.Duration
-	Complete  bool
-}
-
-// TrackResult carries one ordered prepared track or a producer failure.
-type TrackResult struct {
-	Track Track
-	Err   error
-}
-
 // Transport controls one active audio file.
 type Transport interface {
-	Load(path string) error
+	Load(string) error
 	Play() error
 	Pause()
-	Seek(position time.Duration) error
+	Seek(time.Duration) error
 	Position() time.Duration
 	IsPlaying() bool
 }
 
-// View receives preparation, playback, and control events.
+// View separates a text-only selection preview from actual audio activation.
 type View interface {
 	Prepared(prepared, total int) error
 	Start(total int) error
@@ -68,465 +57,240 @@ type View interface {
 	Paused(index, total int) error
 	Resumed(index, total int) error
 	Buffering(index, total int) error
+	Selected(index, total int, text string, sentence int) error
 	Seeked(index, total int, text string, sentence int, playing bool, delta, position, duration time.Duration, complete bool) error
 	Failed(index, total int, err error) error
 	Finish(total int) error
 }
 
-// Play renders and controls an ordered stream of synthesized audio tracks.
-// Source chapters define every navigation boundary before audio is ready.
-func Play(ctx context.Context, chapters []string, results <-chan TrackResult, transport Transport, commands <-chan Command, view View) error {
-	sentenceCounts := make([]int, len(chapters))
-	for index, text := range chapters {
-		sentenceCounts[index] = len(textchunk.Sentences(text))
-	}
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-	return playStream(ctx, sentenceCounts, results, transport, commands, view, ticker.C)
-}
-
-type navigationTarget struct {
-	chapter  int
-	sentence int
-}
-
 type streamPlayer struct {
-	total           int
-	results         <-chan TrackResult
-	transport       Transport
-	commands        <-chan Command
-	view            View
-	ticks           <-chan time.Time
-	tracks          []Track
-	sentenceCounts  []int
-	offsets         []time.Duration
-	current         int
-	currentSentence int
-	playing         bool
-	active          bool
-	spoken          bool
-	waiting         bool
-	pending         *navigationTarget
+	chapters   []string
+	texts      [][]string
+	source     AudioSource
+	transport  Transport
+	view       View
+	cache      map[Target]SentenceTrack
+	target     Target // Latest text selection or automatic playback destination.
+	loaded     Target // Last audio loaded; may differ from the preview.
+	playing    bool   // User intent, independent of buffering or selection.
+	active     bool
+	awaiting   bool
+	selecting  bool
+	navigating bool
+	started    bool
+	hasLoaded  bool
 }
 
-func playStream(ctx context.Context, sentenceCounts []int, results <-chan TrackResult, transport Transport, commands <-chan Command, view View, ticks <-chan time.Time) error {
-	total := len(sentenceCounts)
-	if err := validateStream(ctx, total, results, transport, view); err != nil {
-		return err
-	}
-	for index, count := range sentenceCounts {
-		if count <= 0 {
-			return fmt.Errorf("chapter %d has no sentences", index+1)
-		}
-	}
-	p := &streamPlayer{
-		total:           total,
-		sentenceCounts:  sentenceCounts,
-		results:         results,
-		transport:       transport,
-		commands:        commands,
-		view:            view,
-		ticks:           ticks,
-		offsets:         []time.Duration{0},
-		current:         -1,
-		currentSentence: -1,
-		playing:         true,
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			if p.current < 0 {
-				return ctx.Err()
-			}
-			return reportFailure(view, p.current, total, ctx.Err())
-		case result, ok := <-p.results:
-			if !ok {
-				if err := ctx.Err(); err != nil {
-					if p.current < 0 {
-						return err
-					}
-					return reportFailure(view, p.current, total, err)
-				}
-				p.results = nil
-				if len(p.tracks) != total {
-					return p.fail(fmt.Errorf("track stream prepared %d of %d tracks", len(p.tracks), total))
-				}
-				if !p.complete() {
-					return p.fail(fmt.Errorf("track stream closed before track %d sentence audio completed", len(p.tracks)))
-				}
-				finished, err := p.resolveWait()
-				if err != nil {
-					return p.fail(err)
-				}
-				if finished {
-					return p.finish()
-				}
-				continue
-			}
-			if result.Err != nil {
-				return p.fail(result.Err)
-			}
-			finished, err := p.addTrack(result.Track)
-			if err != nil {
-				return p.fail(err)
-			}
-			if finished {
-				return p.finish()
-			}
-		case command, ok := <-p.commands:
-			if !ok {
-				p.commands = nil
-				continue
-			}
-			finished, err := p.handleCommands(command)
-			if err != nil {
-				return p.fail(err)
-			}
-			if finished {
-				return p.finish()
-			}
-		case <-p.ticks:
-			finished, err := p.handleTick()
-			if err != nil {
-				return p.fail(err)
-			}
-			if finished {
-				return p.finish()
-			}
-		}
-	}
-}
-
-func validateStream(ctx context.Context, total int, results <-chan TrackResult, transport Transport, view View) error {
+// Play selects by source text and consumes demand-driven sentence audio.
+// The caller owns source shutdown; Play always stops the transport on exit.
+func Play(ctx context.Context, chapters []string, source AudioSource, transport Transport, commands <-chan Command, view View) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if total <= 0 {
-		return fmt.Errorf("total tracks must be greater than zero")
+	if len(chapters) == 0 {
+		return fmt.Errorf("at least one chapter is required")
 	}
-	if results == nil {
-		return fmt.Errorf("track result stream is required")
+	if source == nil || source.Results() == nil {
+		return fmt.Errorf("audio result source is required")
 	}
-	if transport == nil {
-		return fmt.Errorf("audio transport is required")
+	if transport == nil || view == nil {
+		return fmt.Errorf("audio transport and view are required")
 	}
-	if view == nil {
-		return fmt.Errorf("view is required")
+	texts := make([][]string, len(chapters))
+	for i, chapter := range chapters {
+		texts[i] = textchunk.Sentences(chapter)
+		if len(texts[i]) == 0 {
+			return fmt.Errorf("chapter %d has no sentences", i+1)
+		}
+	}
+	p := &streamPlayer{
+		chapters: chapters, texts: texts, source: source, transport: transport, view: view,
+		cache: make(map[Target]SentenceTrack), playing: true, awaiting: true,
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	timer := time.NewTimer(navigationDelay)
+	timer.Stop()
+	defer timer.Stop()
+	defer transport.Pause()
+	var settled <-chan time.Time
+	source.Request(Target{})
+	results := source.Results()
+	handle := func(command Command) error {
+		changed, err := p.handleCommand(command)
+		if changed {
+			timer.Reset(navigationDelay)
+			settled = timer.C
+		}
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return p.fail(ctx.Err())
+		case result, ok := <-results:
+			if !ok {
+				if err := ctx.Err(); err != nil {
+					return p.fail(err)
+				}
+				return p.fail(fmt.Errorf("audio source closed before playback finished"))
+			}
+			if err := p.accept(result); err != nil {
+				return p.fail(err)
+			}
+		case command, ok := <-commands:
+			if !ok {
+				commands = nil
+				continue
+			}
+			if err := handle(command); err != nil {
+				return p.fail(err)
+			}
+		case <-settled:
+			// A queued arrow at the deadline wins over committing the old selection.
+			changed := false
+		drain:
+			for range 32 {
+				select {
+				case command, ok := <-commands:
+					if !ok {
+						commands = nil
+						break drain
+					}
+					moved, err := p.handleCommand(command)
+					if err != nil {
+						return p.fail(err)
+					}
+					changed = changed || moved
+				default:
+					break drain
+				}
+			}
+			if changed {
+				timer.Reset(navigationDelay)
+				continue
+			}
+			settled = nil
+			p.selecting = false
+			if err := p.demand(); err != nil {
+				return p.fail(err)
+			}
+		case <-ticker.C:
+			finished, err := p.tick()
+			if err != nil {
+				return p.fail(err)
+			}
+			if finished {
+				return view.Finish(len(chapters))
+			}
+		}
+	}
+}
+
+func (p *streamPlayer) accept(result AudioResult) error {
+	if !validTarget(p.texts, result.Target) {
+		return fmt.Errorf("invalid audio target: %+v", result.Target)
+	}
+	if result.Err != nil {
+		if !p.selecting && p.awaiting && result.Target == p.target {
+			return result.Err
+		}
+		return nil
+	}
+	if strings.TrimSpace(result.Audio.Path) == "" || result.Audio.Duration <= 0 {
+		return fmt.Errorf("invalid sentence audio at chapter %d sentence %d", result.Target.Chapter+1, result.Target.Sentence+1)
+	}
+	p.cache[result.Target] = result.Audio
+	if !p.selecting && p.awaiting && result.Target == p.target {
+		return p.activate()
 	}
 	return nil
 }
 
-func (p *streamPlayer) addTrack(track Track) (bool, error) {
-	if len(p.tracks) > 0 && !p.tracks[len(p.tracks)-1].Complete {
-		return p.updateTrack(track)
+func (p *streamPlayer) start() error {
+	if p.started {
+		return nil
 	}
-	index := len(p.tracks)
-	if index >= p.total {
-		return false, fmt.Errorf("track stream produced more than %d tracks", p.total)
+	if err := p.view.Start(len(p.chapters)); err != nil {
+		return err
 	}
-	if err := validateTrack(track, index, p.sentenceCounts[index]); err != nil {
-		return false, err
-	}
-	previous := p.offsets[len(p.offsets)-1]
-	if track.Duration > time.Duration(1<<63-1)-previous {
-		return false, fmt.Errorf("total audio duration overflows")
-	}
-	p.tracks = append(p.tracks, track)
-	p.offsets = append(p.offsets, previous+track.Duration)
-	if err := p.view.Prepared(len(p.tracks), p.total); err != nil {
-		return false, fmt.Errorf("render preparation progress: %w", err)
-	}
-
-	if p.current < 0 {
-		if err := p.view.Start(p.total); err != nil {
-			return false, fmt.Errorf("render playback header: %w", err)
-		}
-		p.current = 0
-		if err := p.activate(0); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-	return p.resolveWait()
+	p.started = true
+	return nil
 }
 
-func (p *streamPlayer) updateTrack(track Track) (bool, error) {
-	index := len(p.tracks) - 1
-	if err := validateTrack(track, index, p.sentenceCounts[index]); err != nil {
-		return false, err
+func (p *streamPlayer) demand() error {
+	p.awaiting = true
+	p.source.Request(p.target)
+	if _, ok := p.cache[p.target]; ok {
+		return p.activate()
 	}
-	previous := p.tracks[index]
-	if track.Text != previous.Text {
-		return false, fmt.Errorf("track %d text changed while preparing sentence audio", index+1)
-	}
-	if len(track.Sentences) != len(previous.Sentences)+1 {
-		return false, fmt.Errorf("track %d sentence audio update has %d segments, want %d", index+1, len(track.Sentences), len(previous.Sentences)+1)
-	}
-	for sentenceIndex, sentence := range previous.Sentences {
-		if track.Sentences[sentenceIndex] != sentence {
-			return false, fmt.Errorf("track %d sentence %d changed while preparing audio", index+1, sentenceIndex+1)
-		}
-	}
-	base := p.offsets[index]
-	if track.Duration > time.Duration(1<<63-1)-base {
-		return false, fmt.Errorf("total audio duration overflows")
-	}
-	p.tracks[index] = track
-	p.offsets[index+1] = base + track.Duration
-	return p.resolveWait()
+	return p.view.Buffering(p.target.Chapter, len(p.chapters))
 }
 
-func (p *streamPlayer) resolveWait() (bool, error) {
-	if p.pending != nil {
-		return p.resolveNavigation()
-	}
-	if p.waiting && !p.spoken && p.current >= 0 && p.currentSentence+1 < len(p.tracks[p.current].Sentences) {
-		p.waiting = false
-		if err := p.advanceSentence(); err != nil {
-			return false, err
+func (p *streamPlayer) activate() error {
+	audio := p.cache[p.target]
+	index, total := p.target.Chapter, len(p.chapters)
+	if !p.started {
+		if err := p.view.Prepared(1, total); err != nil {
+			return err
 		}
-		return false, nil
-	}
-	if p.waiting && p.current+1 < len(p.tracks) {
-		p.current++
-		p.waiting = false
-		p.spoken = false
-		if err := p.activate(p.current); err != nil {
-			return false, err
+		if err := p.start(); err != nil {
+			return err
 		}
 	}
-	if p.waiting && p.complete() && p.current == len(p.tracks)-1 {
-		return true, nil
+	if p.navigating {
+		// Navigation is indexed by source text. Unknown earlier audio durations
+		// must never be fabricated or required to select a later sentence.
+		if err := p.view.Seeked(index, total, p.chapters[index], p.target.Sentence, p.playing, 0, 0, 0, false); err != nil {
+			return err
+		}
+	} else if !p.hasLoaded || p.loaded.Chapter != index {
+		if err := p.view.Speaking(index, total, p.chapters[index]); err != nil {
+			return err
+		}
+	} else {
+		if err := p.view.Progress(index, total, p.target.Sentence); err != nil {
+			return err
+		}
 	}
-	return false, nil
+	if err := p.transport.Load(audio.Path); err != nil {
+		return fmt.Errorf("load chapter %d sentence %d: %w", index+1, p.target.Sentence+1, err)
+	}
+	p.loaded, p.hasLoaded, p.active, p.awaiting, p.navigating = p.target, true, true, false, false
+	if p.playing {
+		if err := p.transport.Play(); err != nil {
+			return fmt.Errorf("play chapter %d sentence %d: %w", index+1, p.target.Sentence+1, err)
+		}
+	} else if err := p.view.Paused(index, total); err != nil {
+		return err
+	}
+	return nil
 }
 
-func (p *streamPlayer) handleCommands(command Command) (bool, error) {
-	// Drain only a bounded snapshot. Holding a key must not build a queue of
-	// expensive native seeks or starve audio preparation and cancellation.
-	batch := []Command{command}
-drain:
-	for len(batch) < 32 {
-		select {
-		case next, ok := <-p.commands:
-			if !ok {
-				p.commands = nil
-				break drain
-			}
-			batch = append(batch, next)
-		default:
-			break drain
-		}
-	}
-	for index := 0; index < len(batch); {
-		command := batch[index]
-		count := 1
-		if command != Toggle {
-			for index+count < len(batch) && batch[index+count] == command {
-				count++
-			}
-		}
-		if finished, err := p.handleRepeatedCommand(command, count); err != nil || finished {
-			return finished, err
-		}
-		index += count
-	}
-	return false, nil
-}
-
-func (p *streamPlayer) handleRepeatedCommand(command Command, count int) (bool, error) {
-	if p.current < 0 {
-		if command == Toggle {
-			p.playing = !p.playing
-		}
+func (p *streamPlayer) tick() (bool, error) {
+	if p.selecting || !p.playing || !p.active || p.transport.IsPlaying() {
 		return false, nil
-	}
-	switch command {
-	case Toggle:
-		if p.playing {
-			if p.active {
-				p.transport.Pause()
-			}
-			p.playing = false
-			if err := p.view.Paused(p.current, p.total); err != nil {
-				return false, fmt.Errorf("render paused state: %w", err)
-			}
-			return false, nil
-		}
-		p.playing = true
-		if p.active {
-			if err := p.transport.Play(); err != nil {
-				return false, fmt.Errorf("resume track %d of %d: %w", p.current+1, p.total, err)
-			}
-		}
-		if err := p.view.Resumed(p.current, p.total); err != nil {
-			return false, fmt.Errorf("render resumed state: %w", err)
-		}
-	case Backward, Forward:
-		direction := -count
-		if command == Forward {
-			direction = count
-		}
-		return p.requestSentence(direction)
-	case PreviousChapter:
-		return p.requestChapter(-count)
-	case NextChapter:
-		return p.requestChapter(count)
-	}
-	return false, nil
-}
-
-func (p *streamPlayer) handleTick() (bool, error) {
-	if p.current < 0 || !p.playing || !p.active {
-		return false, nil
-	}
-	if p.transport.IsPlaying() {
-		return false, nil
-	}
-	track := p.tracks[p.current]
-	if p.currentSentence+1 < len(track.Sentences) {
-		if err := p.advanceSentence(); err != nil {
-			return false, err
-		}
-		return false, nil
-	}
-	if !track.Complete {
-		p.active = false
-		if !p.waiting {
-			p.waiting = true
-			if err := p.view.Buffering(p.current, p.total); err != nil {
-				return false, fmt.Errorf("render buffering state: %w", err)
-			}
-		}
-		return false, nil
-	}
-	if !p.spoken {
-		if err := p.view.Spoken(p.current, p.total); err != nil {
-			return false, fmt.Errorf("render completion for track %d of %d: %w", p.current+1, p.total, err)
-		}
-		p.spoken = true
-		p.currentSentence = -1
 	}
 	p.active = false
-	if p.current+1 < len(p.tracks) {
-		p.current++
-		p.spoken = false
-		if err := p.activate(p.current); err != nil {
+	if p.target.Sentence == len(p.texts[p.target.Chapter])-1 {
+		if err := p.view.Spoken(p.target.Chapter, len(p.chapters)); err != nil {
 			return false, err
 		}
-		return false, nil
 	}
-	if p.complete() {
+	next, ok := following(p.texts, p.target)
+	if !ok {
 		return true, nil
 	}
-	if !p.waiting {
-		p.waiting = true
-		if err := p.view.Buffering(p.current+1, p.total); err != nil {
-			return false, fmt.Errorf("render buffering state: %w", err)
-		}
-	}
-	return false, nil
-}
-
-func (p *streamPlayer) advanceSentence() error {
-	p.currentSentence++
-	sentence := p.tracks[p.current].Sentences[p.currentSentence]
-	if err := p.transport.Load(sentence.Path); err != nil {
-		return fmt.Errorf("load sentence %d of track %d of %d: %w", p.currentSentence+1, p.current+1, p.total, err)
-	}
-	if err := p.view.Progress(p.current, p.total, p.currentSentence); err != nil {
-		return fmt.Errorf("render sentence progress for track %d of %d: %w", p.current+1, p.total, err)
-	}
-	if p.playing {
-		if err := p.transport.Play(); err != nil {
-			return fmt.Errorf("play sentence %d of track %d of %d: %w", p.currentSentence+1, p.current+1, p.total, err)
-		}
-	}
-	p.active = true
-	return nil
-}
-
-func (p *streamPlayer) activate(index int) error {
-	track := p.tracks[index]
-	if err := p.transport.Load(track.Sentences[0].Path); err != nil {
-		return fmt.Errorf("load first sentence of track %d of %d: %w", index+1, p.total, err)
-	}
-	if err := p.view.Speaking(index, p.total, track.Text); err != nil {
-		return fmt.Errorf("render track %d of %d before playback: %w", index+1, p.total, err)
-	}
-	if !p.playing {
-		if err := p.view.Paused(index, p.total); err != nil {
-			return fmt.Errorf("render paused state: %w", err)
-		}
-	}
-	p.currentSentence = 0
-	if p.playing {
-		if err := p.transport.Play(); err != nil {
-			return fmt.Errorf("play track %d of %d: %w", index+1, p.total, err)
-		}
-	}
-	p.active = true
-	return nil
-}
-
-func (p *streamPlayer) knownDuration() time.Duration {
-	return p.offsets[len(p.offsets)-1]
-}
-
-func (p *streamPlayer) complete() bool {
-	return len(p.tracks) == p.total && p.tracks[len(p.tracks)-1].Complete
+	p.target = next
+	return false, p.demand()
 }
 
 func (p *streamPlayer) fail(err error) error {
-	if p.current < 0 {
+	if !p.started {
 		return err
 	}
-	return reportFailure(p.view, p.current, p.total, err)
-}
-
-func (p *streamPlayer) finish() error {
-	if err := p.view.Finish(p.total); err != nil {
-		return fmt.Errorf("render playback summary: %w", err)
+	if renderErr := p.view.Failed(p.target.Chapter, len(p.chapters), err); renderErr != nil {
+		return errors.Join(err, renderErr)
 	}
-	return nil
-}
-
-func validateTrack(track Track, index, sentenceCount int) error {
-	if strings.TrimSpace(track.Text) == "" {
-		return fmt.Errorf("track %d text is empty", index+1)
-	}
-	if len(track.Sentences) == 0 {
-		return fmt.Errorf("track %d has no sentence audio", index+1)
-	}
-	if len(track.Sentences) > sentenceCount || track.Complete && len(track.Sentences) != sentenceCount {
-		return fmt.Errorf("track %d audio sentence count %d does not match source count %d", index+1, len(track.Sentences), sentenceCount)
-	}
-	if track.Duration <= 0 {
-		return fmt.Errorf("track %d duration must be greater than zero", index+1)
-	}
-	total := time.Duration(0)
-	for sentenceIndex, sentence := range track.Sentences {
-		if strings.TrimSpace(sentence.Path) == "" {
-			return fmt.Errorf("track %d sentence %d path is empty", index+1, sentenceIndex+1)
-		}
-		if sentence.Duration <= 0 {
-			return fmt.Errorf("track %d sentence %d duration must be greater than zero", index+1, sentenceIndex+1)
-		}
-		if sentence.Duration > time.Duration(1<<63-1)-total {
-			return fmt.Errorf("track %d duration overflows", index+1)
-		}
-		total += sentence.Duration
-	}
-	if track.Duration != total {
-		return fmt.Errorf("track %d duration %s does not match sentence audio total %s", index+1, track.Duration, total)
-	}
-	return nil
-}
-
-func reportFailure(view View, index, total int, playbackErr error) error {
-	if renderErr := view.Failed(index, total, playbackErr); renderErr != nil {
-		return errors.Join(playbackErr, fmt.Errorf("render playback failure: %w", renderErr))
-	}
-	return playbackErr
+	return err
 }

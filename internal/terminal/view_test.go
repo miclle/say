@@ -11,6 +11,45 @@ import (
 	"unicode/utf8"
 )
 
+func TestViewPreviewsUnpreparedSentenceInExistingChapterList(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"One.", "Two. Three."})
+	view.Start(2)
+	view.Speaking(0, 2, "One.")
+	if err := view.Selected(1, 2, "Two. Three.", 1); err != nil {
+		t.Fatal(err)
+	}
+	if view.activeChapter != 1 || view.activeSentence != 1 || view.playing {
+		t.Fatalf("selection did not move independently of audio: %+v", view)
+	}
+	if len(view.chapters) != 2 || !strings.Contains(view.chapterStatus, "selecting") || strings.Contains(output.String(), "buffering") {
+		t.Fatalf("preview changed chapter structure or reported audio buffering: %q", output.String())
+	}
+	view.Buffering(1, 2)
+	view.Seeked(1, 2, "Two. Three.", 1, true, 0, 0, 0, false)
+	if view.chapterStatus != "" || view.activeSentence != 1 || !view.playing {
+		t.Fatal("activation did not clear selection/buffering")
+	}
+}
+
+func TestViewBufferingInitializesNewChapterWithoutResettingSelectedSentence(t *testing.T) {
+	var output bytes.Buffer
+	view := New(&output, true, "notes.md", "test TTS")
+	view.SetChapters([]string{"One.", "Two. Three."})
+	view.Speaking(0, 2, "One.")
+	view.Spoken(0, 2)
+	view.Buffering(1, 2)
+	if view.activeChapter != 1 || view.activeSentence != 0 || view.activeComplete {
+		t.Fatalf("buffering retained previous chapter state: chapter=%d sentence=%d complete=%t", view.activeChapter, view.activeSentence, view.activeComplete)
+	}
+	view.Selected(1, 2, "Two. Three.", 1)
+	view.Buffering(1, 2)
+	if view.activeChapter != 1 || view.activeSentence != 1 || view.activeComplete || view.playing {
+		t.Fatal("same-chapter buffering reset the selected sentence or pause state")
+	}
+}
+
 func TestViewRendersPlaybackLifecycleWithoutColor(t *testing.T) {
 	var output bytes.Buffer
 	view := New(&output, false, "lesson.txt", "macOS say (system voice)")
@@ -368,7 +407,7 @@ func TestViewKeepsEmojiGraphemeTogetherWhenWrapping(t *testing.T) {
 	}
 }
 
-func TestViewKeepsCompletedIconWhenResumingDuringBuffering(t *testing.T) {
+func TestViewKeepsPreviousChapterCompletedWhenResumingBufferedTarget(t *testing.T) {
 	screen := newTestTerminalScreen()
 	view := New(screen, false, "notes.md", "test TTS")
 	view.SetChapters([]string{"One.", "Two."})
@@ -377,12 +416,12 @@ func TestViewKeepsCompletedIconWhenResumingDuringBuffering(t *testing.T) {
 	view.Speaking(0, 2, "One.")
 	view.Spoken(0, 2)
 	view.Buffering(1, 2)
-	view.Paused(0, 2)
-	view.Resumed(0, 2)
+	view.Paused(1, 2)
+	view.Resumed(1, 2)
 
 	want := []string{
 		"[1/2] ✓ One.",
-		"[2/2] · Two.",
+		"[2/2] ▶ Two.",
 	}
 	if got := screen.chapterLines(); !equalStrings(got, want) {
 		t.Fatalf("visible chapter lines = %#v, want %#v", got, want)

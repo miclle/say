@@ -1,101 +1,69 @@
 package player
 
-import "fmt"
-
-func (p *streamPlayer) navigationPosition() navigationTarget {
-	if p.pending != nil {
-		return *p.pending
-	}
-	sentence := p.currentSentence
-	if p.spoken {
-		sentence = len(p.tracks[p.current].Sentences) - 1
-	}
-	return navigationTarget{chapter: p.current, sentence: max(0, sentence)}
-}
-
-func (p *streamPlayer) requestSentence(direction int) (bool, error) {
-	from := p.navigationPosition()
-	target := from
-	target.sentence += direction
-	target = p.normalizeTarget(target)
-	if target == from && p.pending == nil {
-		return false, nil
-	}
-	p.pending = &target
-	p.waiting = false
-	return p.resolveNavigation()
-}
-
-func (p *streamPlayer) requestChapter(direction int) (bool, error) {
-	from := p.navigationPosition()
-	chapter := max(0, min(p.total-1, from.chapter+direction))
-	if chapter == from.chapter {
-		return false, nil
-	}
-	p.pending = &navigationTarget{chapter: chapter}
-	p.waiting = false
-	return p.resolveNavigation()
-}
-
-// All chapter boundaries are known from the source text before synthesis.
-// Mixed sentence/chapter keys must not depend on which audio is ready yet.
-func (p *streamPlayer) normalizeTarget(target navigationTarget) navigationTarget {
-	for target.sentence < 0 && target.chapter > 0 {
-		target.chapter--
-		target.sentence += p.sentenceCounts[target.chapter]
-	}
-	if target.chapter == 0 && target.sentence < 0 {
-		target.sentence = 0
-	}
-	for target.sentence >= p.sentenceCounts[target.chapter] {
-		count := p.sentenceCounts[target.chapter]
-		if target.chapter == p.total-1 {
-			target.sentence = count - 1
-			break
-		}
-		target.sentence -= count
-		target.chapter++
-	}
-	return target
-}
-
-func (p *streamPlayer) resolveNavigation() (bool, error) {
-	target := p.normalizeTarget(*p.pending)
-	p.pending = &target
-	if target.chapter >= len(p.tracks) || target.sentence < 0 || target.sentence >= len(p.tracks[target.chapter].Sentences) {
-		// Give immediate feedback, before a native pause can block the loop.
-		if err := p.view.Buffering(target.chapter, p.total); err != nil {
-			return false, fmt.Errorf("render navigation buffering state: %w", err)
-		}
+func (p *streamPlayer) handleCommand(command Command) (bool, error) {
+	if command == Toggle {
+		p.playing = !p.playing
 		if p.active {
-			p.transport.Pause()
-			p.active = false
+			if p.playing {
+				if err := p.transport.Play(); err != nil {
+					return false, err
+				}
+			} else {
+				p.transport.Pause()
+			}
 		}
+		if !p.started {
+			return false, nil
+		}
+		if p.selecting {
+			return false, p.view.Selected(p.target.Chapter, len(p.chapters), p.chapters[p.target.Chapter], p.target.Sentence)
+		}
+		if p.playing {
+			return false, p.view.Resumed(p.target.Chapter, len(p.chapters))
+		}
+		return false, p.view.Paused(p.target.Chapter, len(p.chapters))
+	}
+	target := p.target
+	switch command {
+	case Backward:
+		if target.Sentence > 0 {
+			target.Sentence--
+		} else if target.Chapter > 0 {
+			target.Chapter--
+			target.Sentence = len(p.texts[target.Chapter]) - 1
+		}
+	case Forward:
+		if next, ok := following(p.texts, target); ok {
+			target = next
+		}
+	case PreviousChapter:
+		if target.Chapter > 0 {
+			target.Chapter--
+			target.Sentence = 0
+		}
+	case NextChapter:
+		if target.Chapter+1 < len(p.texts) {
+			target.Chapter++
+			target.Sentence = 0
+		}
+	default:
 		return false, nil
 	}
-	p.pending = nil
-	track := p.tracks[target.chapter]
-	position := p.offsets[target.chapter]
-	for _, sentence := range track.Sentences[:target.sentence] {
-		position += sentence.Duration
+	if target == p.target && !p.selecting {
+		return false, nil
 	}
-	// Selection is cheap to render; do not make keyboard feedback wait for
-	// native file preparation or stopping the old audio.
-	if err := p.view.Seeked(target.chapter, p.total, track.Text, target.sentence, p.playing, 0, position, p.knownDuration(), p.complete()); err != nil {
-		return false, fmt.Errorf("render navigation state: %w", err)
+	p.target = target
+	p.selecting, p.navigating, p.awaiting = true, true, false
+	if err := p.start(); err != nil {
+		return false, err
 	}
-	p.current = target.chapter
-	p.currentSentence = target.sentence
-	p.spoken = false
-	p.active = false
-	if err := p.transport.Load(track.Sentences[target.sentence].Path); err != nil {
-		return false, fmt.Errorf("load sentence %d of track %d of %d: %w", target.sentence+1, target.chapter+1, p.total, err)
+	if err := p.view.Selected(target.Chapter, len(p.chapters), p.chapters[target.Chapter], target.Sentence); err != nil {
+		return false, err
 	}
-	p.active = true
-	if p.playing {
-		if err := p.transport.Play(); err != nil {
-			return false, fmt.Errorf("play track %d of %d after navigation: %w", target.chapter+1, p.total, err)
-		}
+	if p.active {
+		p.transport.Pause()
+		p.active = false
 	}
-	return false, nil
+	p.source.Suspend()
+	return true, nil
 }

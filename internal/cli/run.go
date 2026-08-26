@@ -213,11 +213,9 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		commands = terminal.ReadCommands(commandCtx, deps.input)
 	}
 
-	preparationCtx, cancelPreparation := context.WithCancel(ctx)
-	results, preparationDone := prepareTracks(preparationCtx, chunks, tempDir, synthesizer, deps.readDuration)
-	playbackErr := player.Play(ctx, chunks, results, transport, commands, view)
-	cancelPreparation()
-	<-preparationDone
+	preparation := prepareAudio(ctx, chunks, tempDir, synthesizer, deps.readDuration)
+	playbackErr := player.Play(ctx, chunks, preparation, transport, commands, view)
+	preparation.Close()
 	cancelCommands()
 	restoreErr := restore()
 	if playbackErr != nil {
@@ -360,80 +358,40 @@ func selectTTSProvider(ctx context.Context, input io.Reader, output io.Writer) (
 	return providers[selected], nil
 }
 
-func prepareTracks(
+func prepareAudio(
 	ctx context.Context,
 	chunks []string,
 	tempDir string,
 	synthesizer tts.Synthesizer,
 	readDuration durationReader,
-) (<-chan player.TrackResult, <-chan struct{}) {
-	results := make(chan player.TrackResult)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		defer close(results)
-		for i, chunk := range chunks {
-			if ctx.Err() != nil {
-				return
+) *player.Preparation {
+	return player.NewPreparation(ctx, chunks, func(ctx context.Context, target player.Target, text string) (player.SentenceTrack, error) {
+		outputPath := filepath.Join(tempDir, fmt.Sprintf("%06d-%03d%s", target.Chapter+1, target.Sentence+1, synthesizer.Extension()))
+		keep := false
+		defer func() {
+			if !keep {
+				_ = os.Remove(outputPath)
 			}
-			texts := textchunk.Sentences(chunk)
-			sentences := make([]player.SentenceTrack, 0, len(texts))
-			totalDuration := time.Duration(0)
-			for sentenceIndex, sentenceText := range texts {
-				outputPath := filepath.Join(tempDir, fmt.Sprintf("%06d-%03d%s", i+1, sentenceIndex+1, synthesizer.Extension()))
-				if err := synthesizer.Synthesize(ctx, sentenceText, outputPath); err != nil {
-					if ctxErr := ctx.Err(); ctxErr != nil {
-						return
-					}
-					sendTrackResult(ctx, results, player.TrackResult{
-						Err: fmt.Errorf("synthesize track %d of %d sentence %d of %d: %w", i+1, len(chunks), sentenceIndex+1, len(texts), err),
-					})
-					return
-				}
-				duration, err := readDuration(outputPath)
-				if err != nil {
-					sendTrackResult(ctx, results, player.TrackResult{
-						Err: fmt.Errorf("inspect track %d of %d sentence %d of %d: %w", i+1, len(chunks), sentenceIndex+1, len(texts), err),
-					})
-					return
-				}
-				if duration <= 0 {
-					sendTrackResult(ctx, results, player.TrackResult{
-						Err: fmt.Errorf("inspect track %d of %d sentence %d of %d: audio duration must be greater than zero", i+1, len(chunks), sentenceIndex+1, len(texts)),
-					})
-					return
-				}
-				if duration > time.Duration(1<<63-1)-totalDuration {
-					sendTrackResult(ctx, results, player.TrackResult{
-						Err: fmt.Errorf("inspect track %d of %d: total sentence audio duration overflows", i+1, len(chunks)),
-					})
-					return
-				}
-				totalDuration += duration
-				sentences = append(sentences, player.SentenceTrack{Path: outputPath, Duration: duration})
-				if !sendTrackResult(ctx, results, player.TrackResult{
-					Track: player.Track{
-						Text:      chunk,
-						Sentences: append([]player.SentenceTrack(nil), sentences...),
-						Duration:  totalDuration,
-						Complete:  sentenceIndex == len(texts)-1,
-					},
-				}) {
-					return
-				}
-			}
+		}()
+		if err := synthesizer.Synthesize(ctx, text, outputPath); err != nil {
+			return player.SentenceTrack{}, fmt.Errorf("synthesize track %d of %d sentence %d: %w", target.Chapter+1, len(chunks), target.Sentence+1, err)
 		}
-	}()
-	return results, done
-}
-
-func sendTrackResult(ctx context.Context, results chan<- player.TrackResult, result player.TrackResult) bool {
-	select {
-	case results <- result:
-		return true
-	case <-ctx.Done():
-		return false
-	}
+		if err := ctx.Err(); err != nil {
+			return player.SentenceTrack{}, err
+		}
+		duration, err := readDuration(outputPath)
+		if err != nil {
+			return player.SentenceTrack{}, fmt.Errorf("inspect track %d of %d sentence %d: %w", target.Chapter+1, len(chunks), target.Sentence+1, err)
+		}
+		if duration <= 0 {
+			return player.SentenceTrack{}, fmt.Errorf("inspect track %d of %d: audio duration must be greater than zero", target.Chapter+1, len(chunks))
+		}
+		if err := ctx.Err(); err != nil {
+			return player.SentenceTrack{}, err
+		}
+		keep = true
+		return player.SentenceTrack{Path: outputPath, Duration: duration}, nil
+	})
 }
 
 func isCharacterDevice(value any) bool {

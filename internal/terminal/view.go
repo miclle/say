@@ -131,7 +131,7 @@ func (v *View) SetControls(enabled bool) {
 	v.controls = enabled
 }
 
-// Preparing announces that ordered audio preparation is starting.
+// Preparing announces that initial audio preparation is starting.
 func (v *View) Preparing(total int) error {
 	if err := v.writeHeader(total); err != nil {
 		return err
@@ -247,6 +247,13 @@ func (v *View) Resumed(index, _ int) error {
 // Buffering reports that playback reached audio which is still being prepared.
 func (v *View) Buffering(index, total int) error {
 	if v.chapterMode() {
+		if index != v.activeChapter {
+			// A new buffered chapter must not inherit the completed chapter's
+			// icon or sentence cursor when Space changes playback intent.
+			v.activeChapter = index
+			v.activeSentence = v.validSentence(index, 0)
+			v.activeComplete = false
+		}
 		v.chapterStatus = fmt.Sprintf("… buffering speech unit %d/%d", index+1, total)
 		return v.renderChapters()
 	}
@@ -256,6 +263,20 @@ func (v *View) Buffering(index, total int) error {
 		v.rowsBelowCurrent += v.displayRows(line)
 	}
 	return err
+}
+
+// Selected previews source text without claiming the selected audio is playing.
+func (v *View) Selected(index, total int, text string, sentence int) error {
+	if v.chapterMode() {
+		v.setChapterText(index, text)
+		v.activeChapter = index
+		v.activeSentence = v.validSentence(index, sentence)
+		v.activeComplete = false
+		v.playing = false
+		v.chapterStatus = fmt.Sprintf("… selecting speech unit %d/%d", index+1, total)
+		return v.renderChapters()
+	}
+	return v.replaceSpeechLine(index, total, text, "", "⏸")
 }
 
 func (v *View) Seeked(index, total int, text string, sentence int, playing bool, _ time.Duration, position, duration time.Duration, complete bool) error {

@@ -4,478 +4,191 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
-func TestPlayStartsWhenFirstStreamedTrackIsReady(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 4 * time.Second})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- Play(ctx, []string{"first", "second"}, results, transport, nil, view)
-	}()
-	results <- trackResult("first", "one.aiff", 4*time.Second)
-
-	transport.waitForEvent(t, "play:one.aiff")
-	select {
-	case err := <-done:
-		t.Fatalf("Play() returned before track 2 was produced: %v", err)
-	default:
-	}
-	wantPrefix := []string{"prepared:1:2", "start:2", "load:one.aiff", "speaking:0:first", "play:one.aiff"}
-	if got := transport.snapshot(); !reflect.DeepEqual(got, wantPrefix) {
-		t.Fatalf("events = %#v, want %#v", got, wantPrefix)
-	}
-
-	cancel()
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Play() error = %v, want context.Canceled", err)
-	}
+type demandSource struct {
+	results chan AudioResult
+	events  *eventLog
 }
 
-func TestPlayShowsPausedWhenToggledBeforeFirstTrackIsReady(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 4 * time.Second})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	commands := make(chan Command)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
+func (s *demandSource) Results() <-chan AudioResult { return s.results }
+func (s *demandSource) Request(target Target) {
+	s.events.add(fmt.Sprintf("request:%d:%d", target.Chapter, target.Sentence))
+}
+func (s *demandSource) Suspend() { s.events.add("suspend") }
 
-	go func() {
-		done <- playStream(ctx, []int{1}, results, transport, commands, view, make(chan time.Time))
-	}()
-	commands <- Toggle
-	results <- trackResult("first", "one.aiff", 4*time.Second)
-	transport.waitForEvent(t, "paused:0")
-	if transport.isPlaying() {
-		t.Fatal("transport started after playback was paused during preparation")
-	}
-	commands <- Toggle
-	transport.waitForEvent(t, "play:one.aiff")
-
-	cancel()
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("playStream() error = %v, want context.Canceled", err)
-	}
+type demandHarness struct {
+	t         *testing.T
+	source    *demandSource
+	transport *fakeTransport
+	commands  chan Command
+	done      chan error
 }
 
-func TestPlayBuffersUntilNextStreamedTrackIsReady(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 4 * time.Second, "two.aiff": 6 * time.Second})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	ticks := make(chan time.Time)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(context.Background(), []int{1, 1}, results, transport, nil, view, ticks)
-	}()
-	results <- trackResult("first", "one.aiff", 4*time.Second)
-	transport.waitForEvent(t, "play:one.aiff")
-	transport.finishCurrent()
-	ticks <- time.Now()
-	transport.waitForEvent(t, "buffering:1:2")
-
-	results <- trackResult("second", "two.aiff", 6*time.Second)
-	transport.waitForEvent(t, "play:two.aiff")
-	close(results)
-	transport.finishCurrent()
-	ticks <- time.Now()
-
-	if err := waitResult(t, done); err != nil {
-		t.Fatalf("playStream() error = %v", err)
-	}
-	want := []string{
-		"prepared:1:2", "start:2", "load:one.aiff", "speaking:0:first", "play:one.aiff",
-		"spoken:0", "buffering:1:2", "prepared:2:2", "load:two.aiff", "speaking:1:second",
-		"play:two.aiff", "spoken:1", "finish:2",
-	}
-	if got := transport.snapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("events = %#v, want %#v", got, want)
-	}
-}
-
-func TestPlayAdvancesSentenceOnlyWhenCurrentAudioFinishes(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{
-		"one-1.aiff": 4 * time.Second,
-		"one-2.aiff": 6 * time.Second,
-	})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	ticks := make(chan time.Time)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(ctx, []int{2}, results, transport, nil, view, ticks)
-	}()
-	results <- sentenceTrackResult("First. Second.", []SentenceTrack{
-		{Path: "one-1.aiff", Duration: 4 * time.Second},
-		{Path: "one-2.aiff", Duration: 6 * time.Second},
-	})
-	transport.waitForEvent(t, "play:one-1.aiff")
-
-	transport.setPosition(3500 * time.Millisecond)
-	ticks <- time.Now()
-	if got := transport.countEvent("progress:"); got != 0 {
-		t.Fatalf("progress event count = %d, want none while the first sentence audio is playing", got)
-	}
-
-	transport.finishCurrent()
-	ticks <- time.Now()
-	transport.waitForEvent(t, "progress:0:1")
-	transport.waitForEvent(t, "play:one-2.aiff")
-
-	if got := transport.countEvent("progress:"); got != 1 {
-		t.Fatalf("progress event count = %d, want one transition at the audio boundary", got)
-	}
-	if got := transport.countEvent("spoken:"); got != 0 {
-		t.Fatalf("spoken event count = %d, want chapter to remain active after its first sentence", got)
-	}
-
-	cancel()
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("playStream() error = %v, want context.Canceled", err)
-	}
-}
-
-func TestPlayBuffersWithinChapterUntilNextSentenceIsReady(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{
-		"one-1.aiff": 4 * time.Second,
-		"one-2.aiff": 6 * time.Second,
-	})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	ticks := make(chan time.Time)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(context.Background(), []int{2}, results, transport, nil, view, ticks)
-	}()
-	results <- TrackResult{Track: Track{
-		Text:      "First. Second.",
-		Sentences: []SentenceTrack{{Path: "one-1.aiff", Duration: 4 * time.Second}},
-		Duration:  4 * time.Second,
-		Complete:  false,
-	}}
-	transport.waitForEvent(t, "play:one-1.aiff")
-	transport.finishCurrent()
-	ticks <- time.Now()
-	transport.waitForEvent(t, "buffering:0:1")
-	if got := transport.countEvent("spoken:"); got != 0 {
-		t.Fatalf("spoken event count = %d, want incomplete chapter to remain active", got)
-	}
-
-	results <- TrackResult{Track: Track{
-		Text: "First. Second.",
-		Sentences: []SentenceTrack{
-			{Path: "one-1.aiff", Duration: 4 * time.Second},
-			{Path: "one-2.aiff", Duration: 6 * time.Second},
-		},
-		Duration: 10 * time.Second,
-		Complete: true,
-	}}
-	transport.waitForEvent(t, "progress:0:1")
-	transport.waitForEvent(t, "play:one-2.aiff")
-	close(results)
-	transport.finishCurrent()
-	ticks <- time.Now()
-
-	if err := waitResult(t, done); err != nil {
-		t.Fatalf("playStream() error = %v", err)
-	}
-	if got := transport.countEvent("prepared:"); got != 1 {
-		t.Fatalf("prepared event count = %d, want one logical chapter", got)
-	}
-}
-
-func TestPlayPausedSentenceNavigationStartsAtSentenceBeginning(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{
-		"one-1.aiff": 4 * time.Second,
-		"one-2.aiff": 6 * time.Second,
-	})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	commands := make(chan Command)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(ctx, []int{2}, results, transport, commands, view, make(chan time.Time))
-	}()
-	results <- sentenceTrackResult("First. Second.", []SentenceTrack{
-		{Path: "one-1.aiff", Duration: 4 * time.Second},
-		{Path: "one-2.aiff", Duration: 6 * time.Second},
-	})
-	transport.waitForEvent(t, "play:one-1.aiff")
-
-	transport.setPosition(time.Second)
-	commands <- Toggle
-	transport.waitForEvent(t, "paused:0")
-	commands <- Forward
-	transport.waitForEvent(t, "load:one-2.aiff")
-	transport.waitForEvent(t, "seeked:0:1:0s:4s:10s:true")
-
-	if transport.isPlaying() {
-		t.Fatal("paused sentence seek resumed playback")
-	}
-
-	cancel()
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("playStream() error = %v, want context.Canceled", err)
-	}
-	if got := transport.countEvent("progress:"); got != 0 {
-		t.Fatalf("progress event count = %d, want seek state rendered once by Seeked", got)
-	}
-}
-
-func TestPlayBackwardSeekLoadsEarlierSentenceSegment(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{
-		"one-1.aiff": 4 * time.Second,
-		"one-2.aiff": 6 * time.Second,
-	})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	commands := make(chan Command)
-	ticks := make(chan time.Time)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(ctx, []int{2}, results, transport, commands, view, ticks)
-	}()
-	results <- sentenceTrackResult("First. Second.", []SentenceTrack{
-		{Path: "one-1.aiff", Duration: 4 * time.Second},
-		{Path: "one-2.aiff", Duration: 6 * time.Second},
-	})
-	transport.waitForEvent(t, "play:one-1.aiff")
-	transport.finishCurrent()
-	ticks <- time.Now()
-	transport.waitForEvent(t, "progress:0:1")
-	transport.setPosition(2 * time.Second)
-
-	commands <- Toggle
-	transport.waitForEvent(t, "paused:0")
-	commands <- Backward
-	transport.waitForEvent(t, "load:one-1.aiff")
-	transport.waitForEvent(t, "seeked:0:0:0s:0s:10s:true")
-
-	cancel()
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("playStream() error = %v, want context.Canceled", err)
-	}
-	if got := transport.countEvent("progress:"); got != 1 {
-		t.Fatalf("progress event count = %d, want only the playback-tick update before seek", got)
-	}
-}
-
-func TestPlayForwardSeekWaitsForUnpreparedTrack(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 4 * time.Second, "two.aiff": 8 * time.Second})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	commands := make(chan Command)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(ctx, []int{1, 1}, results, transport, commands, view, make(chan time.Time))
-	}()
-	results <- trackResult("first", "one.aiff", 4*time.Second)
-	transport.waitForEvent(t, "play:one.aiff")
-	transport.setPosition(time.Second)
-	commands <- Forward
-	results <- trackResult("second", "two.aiff", 8*time.Second)
-	transport.waitForEvent(t, "load:two.aiff")
-	transport.waitForEvent(t, "seeked:1:0:0s:4s:12s:true")
-	transport.waitForEvent(t, "play:two.aiff")
-	events := transport.snapshot()
-	seekedAt := slices.Index(events, "seeked:1:0:0s:4s:12s:true")
-	playAt := slices.Index(events, "play:two.aiff")
-	if seekedAt < 0 || playAt < 0 || seekedAt > playAt {
-		t.Fatalf("events = %#v, want seek target rendered before playback resumes", events)
-	}
-	if got := transport.countEvent("pause"); got != 1 {
-		t.Fatalf("pause event count = %d, want playback paused while waiting for the seek target", got)
-	}
-	if got := transport.countEvent("buffering:"); got != 1 {
-		t.Fatalf("buffering event count = %d, want feedback for the unprepared sentence", got)
-	}
-	if !transport.isPlaying() {
-		t.Fatal("playing forward seek did not resume at the prepared target")
-	}
-
-	cancel()
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("playStream() error = %v, want context.Canceled", err)
-	}
-}
-
-func TestPlayPausedForwardSeekStaysPausedAfterPreparation(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 4 * time.Second, "two.aiff": 8 * time.Second})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	commands := make(chan Command)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(ctx, []int{1, 1}, results, transport, commands, view, make(chan time.Time))
-	}()
-	results <- trackResult("first", "one.aiff", 4*time.Second)
-	transport.waitForEvent(t, "play:one.aiff")
-	transport.setPosition(time.Second)
-	commands <- Toggle
-	transport.waitForEvent(t, "paused:0")
-	commands <- Forward
-	results <- trackResult("second", "two.aiff", 8*time.Second)
-	transport.waitForEvent(t, "load:two.aiff")
-
-	if transport.isPlaying() {
-		t.Fatal("paused forward seek resumed after target preparation")
-	}
-	if got := transport.countEvent("play:"); got != 1 {
-		t.Fatalf("play event count = %d, want only initial playback", got)
-	}
-
-	cancel()
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("playStream() error = %v, want context.Canceled", err)
-	}
-}
-
-func TestPlayBackwardSeekAcrossPreparedTracksIsImmediate(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": 4 * time.Second, "two.aiff": 8 * time.Second})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	commands := make(chan Command)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(ctx, []int{1, 1}, results, transport, commands, view, make(chan time.Time))
-	}()
-	results <- trackResult("first", "one.aiff", 4*time.Second)
-	transport.waitForEvent(t, "play:one.aiff")
-	results <- trackResult("second", "two.aiff", 8*time.Second)
-	transport.waitForEvent(t, "prepared:2:2")
-
-	transport.setPosition(3500 * time.Millisecond)
-	commands <- Forward
-	transport.waitForEvent(t, "seeked:1:0:0s:4s:12s:true")
-	transport.setPosition(time.Second)
-	commands <- Backward
-	transport.waitForEvent(t, "seeked:0:0:0s:0s:12s:true")
-	if got := transport.countEvent("speaking:"); got != 1 {
-		t.Fatalf("speaking event count = %d, want only the initial non-seek render", got)
-	}
-	cancel()
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("playStream() error = %v, want context.Canceled", err)
-	}
-	if path, position := transport.current(); path != "one.aiff" || position != 0 {
-		t.Fatalf("transport = %q at %s, want one.aiff at 0s", path, position)
-	}
-}
-
-func TestPlayReportsProducerFailure(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": time.Second})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult)
-	done := make(chan error, 1)
-
-	go func() {
-		done <- playStream(context.Background(), []int{1, 1}, results, transport, nil, view, make(chan time.Time))
-	}()
-	results <- trackResult("first", "one.aiff", time.Second)
-	transport.waitForEvent(t, "play:one.aiff")
-	results <- TrackResult{Err: errors.New("synthesis failed")}
-
-	err := waitResult(t, done)
-	if err == nil || !strings.Contains(err.Error(), "synthesis failed") {
-		t.Fatalf("playStream() error = %v, want synthesis failure", err)
-	}
-	transport.waitForEvent(t, "failed:0:synthesis failed")
-}
-
-func TestPlayRejectsStreamThatClosesBeforeTotal(t *testing.T) {
-	transport := newFakeTransport(map[string]time.Duration{"one.aiff": time.Second})
-	view := &recordingView{events: &transport.events}
-	results := make(chan TrackResult, 1)
-	results <- trackResult("first", "one.aiff", time.Second)
-	close(results)
-
-	err := playStream(context.Background(), []int{1, 1}, results, transport, nil, view, make(chan time.Time))
-	if err == nil || !strings.Contains(err.Error(), "prepared 1 of 2") {
-		t.Fatalf("playStream() error = %v, want incomplete-stream error", err)
-	}
-}
-
-func TestPlayCanCancelWhileWaitingForFirstTrack(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	results := make(chan TrackResult)
+func newDemandHarness(t *testing.T, chapters []string) *demandHarness {
+	t.Helper()
 	transport := newFakeTransport(nil)
-	view := &recordingView{events: &transport.events}
+	source := &demandSource{results: make(chan AudioResult, 32), events: &transport.events}
+	commands := make(chan Command, 32)
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-
 	go func() {
-		done <- playStream(ctx, []int{1}, results, transport, nil, view, make(chan time.Time))
+		done <- Play(ctx, chapters, source, transport, commands, &recordingView{events: &transport.events})
 	}()
-	cancel()
-
-	if err := waitResult(t, done); !errors.Is(err, context.Canceled) {
-		t.Fatalf("playStream() error = %v, want context.Canceled", err)
+	t.Cleanup(func() { cancel(); synctest.Wait() })
+	synctest.Wait()
+	return &demandHarness{t, source, transport, commands, done}
+}
+func (h *demandHarness) ready(target Target, path string) {
+	h.source.results <- AudioResult{Target: target, Audio: SentenceTrack{Path: path, Duration: time.Second}}
+	synctest.Wait()
+}
+func (h *demandHarness) command(command Command) { h.commands <- command; synctest.Wait() }
+func (h *demandHarness) settle()                 { time.Sleep(200 * time.Millisecond); synctest.Wait() }
+func (h *demandHarness) finishSentence() {
+	h.transport.finishCurrent()
+	time.Sleep(25 * time.Millisecond)
+	synctest.Wait()
+}
+func (h *demandHarness) assertCount(prefix string, want int) {
+	h.t.Helper()
+	if got := h.transport.countEvent(prefix); got != want {
+		h.t.Fatalf("%s count=%d, want %d; events=%v", prefix, got, want, h.transport.snapshot())
 	}
-	if got := transport.snapshot(); len(got) != 0 {
-		t.Fatalf("events = %#v, want none", got)
+}
+func (h *demandHarness) assertPath(want string, playing bool) {
+	h.t.Helper()
+	if path, pos := h.transport.current(); path != want || pos != 0 || h.transport.isPlaying() != playing {
+		h.t.Fatalf("audio=%s at %s playing=%t; want %s playing=%t; events=%v", path, pos, h.transport.isPlaying(), want, playing, h.transport.snapshot())
 	}
 }
 
-func TestPlayRejectsInvalidStreamInputs(t *testing.T) {
-	tests := []struct {
-		name    string
-		total   int
-		results <-chan TrackResult
-		want    string
-	}{
-		{name: "zero total", results: make(chan TrackResult), want: "total tracks must be greater than zero"},
-		{name: "nil stream", total: 1, want: "track result stream is required"},
-		{name: "closed before first", total: 1, results: closedResults(), want: "prepared 0 of 1"},
-	}
+func TestPlayStartsWithFirstSentenceWhileLaterAudioIsMissing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newDemandHarness(t, []string{"First. Second.", "Third."})
+		h.ready(Target{}, "first.aiff")
+		h.assertPath("first.aiff", true)
+		h.assertCount("start:2", 1)
+		h.assertCount("speaking:0:First. Second.", 1)
+		h.finishSentence()
+		h.assertCount("spoken:", 0)
+		h.assertCount("buffering:0:2", 1)
+		h.ready(Target{0, 1}, "second.aiff")
+		h.assertPath("second.aiff", true)
+		h.assertCount("progress:0:1", 1)
+		h.finishSentence()
+		h.assertCount("spoken:0", 1)
+		h.assertCount("buffering:1:2", 1)
+		h.command(Toggle)
+		h.ready(Target{1, 0}, "third.aiff")
+		h.assertPath("third.aiff", false)
+		h.assertCount("paused:1", 2)
+		h.command(Toggle)
+		h.assertPath("third.aiff", true)
+		h.finishSentence()
+		if err := <-h.done; err != nil {
+			t.Fatal(err)
+		}
+		h.assertCount("finish:2", 1)
+	})
+}
 
-	for _, tt := range tests {
+func TestPlayAdvancesOnlyAfterActualAudioEnds(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newDemandHarness(t, []string{"First. Second."})
+		h.ready(Target{}, "first.aiff")
+		h.ready(Target{0, 1}, "second.aiff")
+		time.Sleep(time.Second)
+		synctest.Wait()
+		h.assertCount("load:", 1)
+		h.finishSentence()
+		h.assertPath("second.aiff", true)
+		h.assertCount("buffering:", 0)
+	})
+}
+
+func TestPlayInitialPauseAndInputClosure(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newDemandHarness(t, []string{"First."})
+		h.command(Toggle)
+		h.ready(Target{}, "first.aiff")
+		h.assertPath("first.aiff", false)
+		h.command(Toggle)
+		close(h.commands)
+		h.finishSentence()
+		if err := <-h.done; err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPlayRejectsInvalidInputsAndAudio(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		chapters []string
+		result   AudioResult
+		want     string
+	}{
+		{"empty", nil, AudioResult{}, "at least one chapter"},
+		{"empty chapter", []string{" "}, AudioResult{}, "no sentences"},
+		{"bad target", []string{"One."}, AudioResult{Target: Target{1, 0}}, "invalid audio target"},
+		{"missing path", []string{"One."}, AudioResult{Audio: SentenceTrack{Duration: time.Second}}, "invalid sentence audio"},
+		{"missing duration", []string{"One."}, AudioResult{Audio: SentenceTrack{Path: "one"}}, "invalid sentence audio"},
+		{"failure", []string{"One."}, AudioResult{Err: errors.New("synthesis failed")}, "synthesis failed"},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			transport := newFakeTransport(nil)
-			err := playStream(context.Background(), []int{1}[:tt.total], tt.results, transport, nil, &recordingView{events: &transport.events}, make(chan time.Time))
-			if err == nil || !strings.Contains(err.Error(), tt.want) {
-				t.Fatalf("playStream() error = %v, want containing %q", err, tt.want)
-			}
+			synctest.Test(t, func(t *testing.T) {
+				h := newDemandHarness(t, tt.chapters)
+				h.source.results <- tt.result
+				synctest.Wait()
+				if err := <-h.done; err == nil || !strings.Contains(err.Error(), tt.want) {
+					t.Fatalf("error=%v want %q", err, tt.want)
+				}
+			})
 		})
 	}
-}
-
-func trackResult(text, path string, duration time.Duration) TrackResult {
-	return sentenceTrackResult(text, []SentenceTrack{{Path: path, Duration: duration}})
-}
-
-func sentenceTrackResult(text string, sentences []SentenceTrack) TrackResult {
-	duration := time.Duration(0)
-	for _, sentence := range sentences {
-		duration += sentence.Duration
+	transport := newFakeTransport(nil)
+	view := &recordingView{events: &transport.events}
+	if err := Play(context.Background(), []string{"One."}, nil, transport, nil, view); err == nil {
+		t.Fatal("accepted nil source")
 	}
-	return TrackResult{Track: Track{Text: text, Sentences: sentences, Duration: duration, Complete: true}}
+	if err := Play(context.Background(), []string{"One."}, &demandSource{}, transport, nil, view); err == nil {
+		t.Fatal("accepted nil results")
+	}
 }
 
-func closedResults() <-chan TrackResult {
-	results := make(chan TrackResult)
-	close(results)
-	return results
+func TestPlayClosedSourceAndCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newDemandHarness(t, []string{"One."})
+		close(h.source.results)
+		synctest.Wait()
+		if err := <-h.done; err == nil || !strings.Contains(err.Error(), "closed") {
+			t.Fatalf("error=%v", err)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := Play(ctx, nil, nil, nil, nil, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestPlayIgnoresObsoleteErrorDuringNavigation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newDemandHarness(t, []string{"One.", "Two."})
+		h.ready(Target{}, "one.aiff")
+		h.command(NextChapter)
+		h.source.results <- AudioResult{Target: Target{}, Err: errors.New("obsolete")}
+		synctest.Wait()
+		h.settle()
+		h.ready(Target{1, 0}, "two.aiff")
+		h.assertPath("two.aiff", true)
+	})
 }
 
 type fakeTransport struct {
@@ -666,4 +379,9 @@ func waitResult(t *testing.T, done <-chan error) error {
 		t.Fatal("timed out waiting for playback result")
 		return nil
 	}
+}
+
+func (v *recordingView) Selected(index, _ int, _ string, sentence int) error {
+	v.events.add(fmt.Sprintf("selected:%d:%d", index, sentence))
+	return nil
 }

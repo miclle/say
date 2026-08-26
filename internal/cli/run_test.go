@@ -57,61 +57,48 @@ func TestRunSynthesizesEveryBoundedChunkAndCleansTemporaryAudio(t *testing.T) {
 	}
 }
 
-func TestPrepareTracksSynthesizesSentencesWithoutSplittingLogicalChapter(t *testing.T) {
-	tempDir := t.TempDir()
+func TestPreparationSynthesizesIndexedSentencesWithoutSplittingLogicalChapter(t *testing.T) {
 	synthesizer := newFakeSynthesizer()
-	durations := []time.Duration{3 * time.Second, 7 * time.Second}
-	readDuration := func(path string) (time.Duration, error) {
-		for index, synthesizedPath := range synthesizer.paths {
-			if path == synthesizedPath {
-				return durations[index], nil
+	source := prepareAudio(context.Background(), []string{"First sentence. Second sentence."}, t.TempDir(), synthesizer,
+		func(path string) (time.Duration, error) {
+			if filepath.Base(path) == "000001-001.aiff" {
+				return 3 * time.Second, nil
 			}
-		}
-		return 0, fmt.Errorf("unknown synthesized path %q", path)
+			return 7 * time.Second, nil
+		})
+	defer source.Close()
+	source.Request(player.Target{})
+	first, second := <-source.Results(), <-source.Results()
+	if first.Err != nil || second.Err != nil {
+		t.Fatalf("preparation errors: %v, %v", first.Err, second.Err)
 	}
-
-	results, done := prepareTracks(
-		context.Background(),
-		[]string{"First sentence. Second sentence."},
-		tempDir,
-		synthesizer,
-		readDuration,
-	)
-	var prepared []player.TrackResult
-	for result := range results {
-		prepared = append(prepared, result)
+	if first.Target != (player.Target{Chapter: 0, Sentence: 0}) || second.Target != (player.Target{Chapter: 0, Sentence: 1}) {
+		t.Fatalf("sentence indices: %+v %+v", first, second)
 	}
-	<-done
-
-	if got := len(prepared); got != 2 {
-		t.Fatalf("track update count = %d, want one update per sentence", got)
+	if first.Audio.Duration != 3*time.Second || second.Audio.Duration != 7*time.Second {
+		t.Fatalf("sentence durations: %+v %+v", first, second)
 	}
-	for _, result := range prepared {
-		if result.Err != nil {
-			t.Fatalf("prepareTracks() error = %v", result.Err)
-		}
+	if filepath.Base(first.Audio.Path) != "000001-001.aiff" || filepath.Base(second.Audio.Path) != "000001-002.aiff" {
+		t.Fatalf("sentence paths: %+v %+v", first, second)
 	}
-	first, result := prepared[0].Track, prepared[1].Track
+	source.Close()
 	if got, want := synthesizer.texts, []string{"First sentence.", "Second sentence."}; !slices.Equal(got, want) {
-		t.Fatalf("synthesized texts = %#v, want %#v", got, want)
+		t.Fatalf("texts=%v", got)
 	}
-	if len(first.Sentences) != 1 || first.Complete {
-		t.Fatalf("first track update = %#v, want one playable incomplete sentence", first)
+}
+
+func TestPreparationDoesNotSynthesizeEntireDocumentAheadOfPlayback(t *testing.T) {
+	source := prepareAudio(context.Background(), []string{"One.", "Two.", "Three.", "Four.", "Five."}, t.TempDir(), newFakeSynthesizer(),
+		func(string) (time.Duration, error) { return time.Second, nil })
+	defer source.Close()
+	source.Request(player.Target{})
+	for range 4 {
+		<-source.Results()
 	}
-	if result.Text != "First sentence. Second sentence." {
-		t.Fatalf("logical track text = %q", result.Text)
-	}
-	if got := len(result.Sentences); got != 2 {
-		t.Fatalf("sentence audio count = %d, want 2", got)
-	}
-	if got, want := filepath.Base(result.Sentences[0].Path), "000001-001.aiff"; got != want {
-		t.Fatalf("first sentence path = %q, want %q", got, want)
-	}
-	if got, want := filepath.Base(result.Sentences[1].Path), "000001-002.aiff"; got != want {
-		t.Fatalf("second sentence path = %q, want %q", got, want)
-	}
-	if result.Duration != 10*time.Second || !result.Complete {
-		t.Fatalf("final logical track = %#v, want complete 10s track", result)
+	select {
+	case result := <-source.Results():
+		t.Fatalf("prepared beyond current plus three sentences: %+v", result)
+	case <-time.After(30 * time.Millisecond):
 	}
 }
 
@@ -888,7 +875,7 @@ func (s *fakeSynthesizer) textForPath(path string) string {
 
 type fakeAudio struct {
 	mu                sync.Mutex
-	output            *bytes.Buffer
+	output            fmt.Stringer
 	synthesizer       *fakeSynthesizer
 	path              string
 	position          time.Duration
@@ -902,7 +889,7 @@ type fakeAudio struct {
 	playStartedOnce   sync.Once
 }
 
-func newFakeAudio(output *bytes.Buffer, synthesizer *fakeSynthesizer) *fakeAudio {
+func newFakeAudio(output fmt.Stringer, synthesizer *fakeSynthesizer) *fakeAudio {
 	return &fakeAudio{output: output, synthesizer: synthesizer, finishAfterPlay: 1}
 }
 
