@@ -15,6 +15,30 @@ func TestSentencesReturnsNaturalSentenceUnits(t *testing.T) {
 	}
 }
 
+func TestSentencesKeepsPunctuationFragmentsWithAdjacentText(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{"function suffix", "再调用既有 queries/create-card!：", []string{"再调用既有 queries/create-card!："}},
+		{"predicate suffix", "检查 valid?；", []string{"检查 valid?；"}},
+		{"quoted punctuation", "他说：“完成！”，", []string{"他说：“完成！”，"}},
+		{"spaced punctuation", "完成！ ：", []string{"完成！ ："}},
+		{"leading ellipsis", "……稍后继续。下一句！", []string{"……稍后继续。", "下一句！"}},
+		{"separate punctuation line", "完成！\n：\n继续。", []string{"完成！ ：", "继续。"}},
+		{"preserve numbers and symbols", "完成！123。🙂", []string{"完成！", "123。", "🙂"}},
+		{"normal sentence boundaries", "完成！继续？结束。", []string{"完成！", "继续？", "结束。"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Sentences(tt.text); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("Sentences(%q) = %#v, want %#v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSplitKeepsNaturalParagraphs(t *testing.T) {
 	got, err := Split("第一句。第二句。\n这一行仍属于同一自然段。\n\n  \n第三句。第四句。", 100)
 	if err != nil {

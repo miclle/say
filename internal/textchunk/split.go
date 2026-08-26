@@ -87,10 +87,18 @@ func sentences(text string) []string {
 	text = strings.ReplaceAll(text, "\r", "\n")
 	runes := []rune(text)
 	start := 0
+	lastStart := 0
 	var result []string
 
 	appendRange := func(end int) {
 		if sentence := normalize(string(runes[start:end])); sentence != "" {
+			// TTS may return no audio for isolated punctuation. Keep it with
+			// adjacent text, preserving the original spacing and punctuation.
+			if last := len(result) - 1; last >= 0 && (isPunctuationOnly(sentence) || isPunctuationOnly(result[last])) {
+				result[last] = normalize(string(runes[lastStart:end]))
+				return
+			}
+			lastStart = start
 			result = append(result, sentence)
 		}
 	}
@@ -117,9 +125,19 @@ func sentences(text string) []string {
 	return result
 }
 
-// Sentences splits text into normalized natural sentence units.
+// Sentences splits text into normalized natural sentence units, keeping
+// punctuation-only fragments with adjacent text when available.
 func Sentences(text string) []string {
 	return sentences(text)
+}
+
+func isPunctuationOnly(text string) bool {
+	for _, r := range text {
+		if !unicode.IsPunct(r) && !unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func isSentenceBoundary(runes []rune, index int) bool {

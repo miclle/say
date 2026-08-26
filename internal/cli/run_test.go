@@ -115,6 +115,26 @@ func TestPrepareTracksSynthesizesSentencesWithoutSplittingLogicalChapter(t *test
 	}
 }
 
+func TestRunKeepsMarkdownFunctionSuffixWithTrailingPunctuation(t *testing.T) {
+	path := writeDocument(t, "lesson.md", "调用既有 `queries/create-card!`：\n\n下一段正常播放。")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	transport := newFakeAudio(&stdout, synthesizer)
+	deps := testDependencies(synthesizer, transport)
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", path}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	want := []string{"调用既有 queries/create-card!：", "下一段正常播放。"}
+	if !slices.Equal(synthesizer.texts, want) {
+		t.Fatalf("synthesized texts = %#v, want %#v", synthesizer.texts, want)
+	}
+	if !strings.Contains(stdout.String(), "✓ Finished 2 speech units.") {
+		t.Fatalf("stdout = %q, want both logical chapters completed", stdout.String())
+	}
+}
+
 func TestRunReadsWebSourceBeforePlayback(t *testing.T) {
 	const source = "https://example.com/articles/readable"
 	var stdout, stderr bytes.Buffer
