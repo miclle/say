@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -138,6 +140,28 @@ func TestEdgeSynthesizerRetriesOneInternalRequestTimeout(t *testing.T) {
 		if attempts == 1 {
 			<-ctx.Done()
 			return nil, ctx.Err()
+		}
+		return []byte("mp3"), nil
+	})
+	outputPath := filepath.Join(t.TempDir(), "speech.mp3")
+
+	if err := synthesizer.Synthesize(context.Background(), "hello", outputPath); err != nil {
+		t.Fatalf("Synthesize() error = %v, want retry success", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if audio, err := os.ReadFile(outputPath); err != nil || string(audio) != "mp3" {
+		t.Fatalf("output audio = %q, %v; want %q", audio, err, "mp3")
+	}
+}
+
+func TestEdgeSynthesizerRetriesOneConnectionReset(t *testing.T) {
+	attempts := 0
+	synthesizer := newEdgeSynthesizer("voice", 1, time.Second, func(context.Context, edgeRequest) ([]byte, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, fmt.Errorf("read Edge TTS response: failed to get reader: %w", syscall.ECONNRESET)
 		}
 		return []byte("mp3"), nil
 	})

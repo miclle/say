@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -110,7 +111,7 @@ func (s *edgeSynthesizer) Synthesize(ctx context.Context, text, outputPath strin
 		if err == nil {
 			break
 		}
-		if ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded) || attempt == edgeMaxAttempts-1 {
+		if ctx.Err() != nil || !isRetryableEdgeError(err) || attempt == edgeMaxAttempts-1 {
 			return fmt.Errorf("Edge TTS synthesis failed: %w", err)
 		}
 	}
@@ -121,6 +122,10 @@ func (s *edgeSynthesizer) Synthesize(ctx context.Context, text, outputPath strin
 		return fmt.Errorf("write Edge TTS audio: %w", err)
 	}
 	return nil
+}
+
+func isRetryableEdgeError(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, syscall.ECONNRESET)
 }
 
 func writeAudioFile(outputPath string, audio []byte) error {
