@@ -1,6 +1,7 @@
 package document
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,12 +23,15 @@ const (
 // ProgressFunc receives source loading stage changes.
 type ProgressFunc func(Stage)
 
-// Read loads and validates a local UTF-8 text document.
+// Read loads and validates a supported local document.
 func Read(path string) (name string, text string, err error) {
-	return readLocal(path, nil)
+	return readLocal(context.Background(), path, nil)
 }
 
-func readLocal(path string, progress ProgressFunc) (name string, text string, err error) {
+func readLocal(ctx context.Context, path string, progress ProgressFunc) (name string, text string, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	report(progress, StageReadingDocument)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -35,6 +39,19 @@ func readLocal(path string, progress ProgressFunc) (name string, text string, er
 	}
 	if !info.Mode().IsRegular() {
 		return "", "", fmt.Errorf("open document %q: not a regular file", path)
+	}
+	extension := strings.ToLower(filepath.Ext(path))
+	if extension == ".docx" || extension == ".doc" {
+		report(progress, StageParsingDocument)
+		if extension == ".docx" {
+			text, err = readDOCX(ctx, path)
+		} else {
+			text, err = readDOC(ctx, path)
+		}
+		if err != nil {
+			return "", "", err
+		}
+		return filepath.Base(path), text, nil
 	}
 
 	data, err := os.ReadFile(path)
@@ -48,7 +65,7 @@ func readLocal(path string, progress ProgressFunc) (name string, text string, er
 	text = strings.TrimPrefix(string(data), "\ufeff")
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
-	if isMarkdownPath(path) {
+	if extension == ".md" || extension == ".markdown" {
 		report(progress, StageParsingDocument)
 		text = markdownToNarration(text)
 	}
@@ -63,9 +80,4 @@ func report(progress ProgressFunc, stage Stage) {
 	if progress != nil {
 		progress(stage)
 	}
-}
-
-func isMarkdownPath(path string) bool {
-	extension := filepath.Ext(path)
-	return strings.EqualFold(extension, ".md") || strings.EqualFold(extension, ".markdown")
 }

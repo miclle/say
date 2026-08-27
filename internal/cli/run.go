@@ -84,7 +84,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: say [flags] <document-or-url>")
 		fmt.Fprintln(stderr)
-		fmt.Fprintln(stderr, "Read a local UTF-8 document or HTTP(S) web article, print each speech unit, and play it with TTS.")
+		fmt.Fprintln(stderr, "Read a local text, Markdown, or Word document, or HTTP(S) web article, print each speech unit, and play it with TTS.")
 		fmt.Fprintln(stderr)
 		fmt.Fprintln(stderr, "Flags:")
 		flags.PrintDefaults()

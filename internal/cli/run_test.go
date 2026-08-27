@@ -709,7 +709,7 @@ func TestRunHelpDescribesInteractiveProviderSelection(t *testing.T) {
 		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "interactive: choose; non-interactive: system") ||
-		!strings.Contains(stderr.String(), "local UTF-8 document or HTTP(S) web article") ||
+		!strings.Contains(stderr.String(), "local text, Markdown, or Word document, or HTTP(S) web article") ||
 		strings.Contains(stderr.String(), `provider string\n\tTTS provider: system or edge (default "system")`) {
 		t.Fatalf("help output = %q, want source and provider-selection guidance", stderr.String())
 	}

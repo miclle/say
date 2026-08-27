@@ -10,13 +10,15 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.2.0
 	github.com/mattn/go-runewidth v0.0.28
 	github.com/miclle/readability.go v0.1.0
+	github.com/richardlehane/mscfb v1.0.7
 	golang.org/x/net v0.58.0
 	golang.org/x/term v0.45.0
+	golang.org/x/text v0.41.0
 )
 
 require (
 	github.com/PuerkitoBio/goquery v1.11.0 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
+	github.com/richardlehane/msoleps v1.0.3 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
 )

@@ -1,6 +1,6 @@
 # say
 
-`say` 是一个用 Go 编写的 macOS 文档与网页朗读终端程序。它读取本地 UTF-8 文本文档，或下载 HTTP(S) 网页并用 [readability.go](https://github.com/miclle/readability.go) 提取正文，再按自然大段落和 TTS 单次调用上限组织内容。第一句音频就绪后立即显示并播放，后台按需预生成后续少量句子。播放过程中可以暂停，也可以按整句或整章前后跳转；连续切换时先选中文本，停止按键后再优先准备最终目标的音频。交互式启动时可以在 TUI 中选择 macOS 系统 TTS 或实验性的 Microsoft Edge TTS。
+`say` 是一个用 Go 编写的 macOS 文档与网页朗读终端程序。它读取本地 UTF-8 文本文档、Word 文档，或下载 HTTP(S) 网页并用 [readability.go](https://github.com/miclle/readability.go) 提取正文，再按自然大段落和 TTS 单次调用上限组织内容。第一句音频就绪后立即显示并播放，后台按需预生成后续少量句子。播放过程中可以暂停，也可以按整句或整章前后跳转；连续切换时先选中文本，停止按键后再优先准备最终目标的音频。交互式启动时可以在 TUI 中选择 macOS 系统 TTS 或实验性的 Microsoft Edge TTS。
 
 ```text
 say  lesson.txt
@@ -18,6 +18,7 @@ Space Play/Pause · ←/→ Sentence · ↑/↓ Chapter
 ## 功能
 
 - 打开任意本地 UTF-8 文本文档；`.txt` 按原文朗读，`.md` 和 `.markdown` 会先转换为适合朗读的语义文本。
+- 使用内置的纯 Go 解析器打开 `.docx` 和 Word 97–2003 `.doc`，不需要安装 Word、LibreOffice 或其他文档转换程序。
 - 直接打开 `http://` 或 `https://` 网页；自动移除导航、脚本等非正文内容，使用提取出的文章标题和自然段进入播放链路。
 - stdout 连接终端时，用英文单行动态加载状态展示文件读取、文档解析、网页读取和正文提取过程；输出重定向时不增加 spinner 或 ANSI 控制字符。
 - Markdown 会移除 front matter、标题与强调标记、列表符号、链接地址、任务框和 HTML 标签；表格按行组织，结构化代码块会跳过，`text`/`plaintext` 代码块保留正文。
@@ -50,6 +51,13 @@ go run ./cmd/say -- ./notes.md
 
 ```bash
 go run ./cmd/say -- https://example.com/article
+```
+
+播放 Word 文档：
+
+```bash
+go run ./cmd/say -- ./report.docx
+go run ./cmd/say -- ./legacy-report.doc
 ```
 
 也可以安装到 `GOBIN`：
@@ -143,9 +151,15 @@ go run ./cmd/say --provider edge --voice en-US-AriaNeural --speed 1.25 ./notes.m
 
 ## 文档边界
 
-本地输入必须是普通 UTF-8 文件且转换后仍有可朗读文字。Markdown 的标题、正文、列表、引用、表格、链接标签、图片 alt 文本和行内代码会保留语义内容；front matter、链接地址、裸 URL、HTML 标签以及 Go、Shell、JSON、Mermaid 等结构化代码块不会发送给 TTS。
+本地纯文本输入必须是 UTF-8 文件且转换后仍有可朗读文字。Markdown 的标题、正文、列表、引用、表格、链接标签、图片 alt 文本和行内代码会保留语义内容；front matter、链接地址、裸 URL、HTML 标签以及 Go、Shell、JSON、Mermaid 等结构化代码块不会发送给 TTS。
 
-远程输入仅支持绝对 `http://` 和 `https://` URL。程序会在本机下载网页 HTML，跟随标准 HTTP 重定向，按响应头或 HTML 元数据声明的字符集转换为 UTF-8，并使用 readability.go 提取标题和正文；请求超时为 15 秒，解压后的响应正文上限为 10 MiB，只接受 `text/html`、`application/xhtml+xml` 或未声明 `Content-Type` 的响应。HTTP 错误、不支持的内容类型、超限响应和无法提取正文的页面会在 TTS 初始化前返回错误。PDF 和 Word 解析尚未包含在当前版本中。
+`.docx` 使用纯 Go 读取 OOXML 包中的主文档正文，保留段落、列表项、手动换行、超链接显示文字和表格单元格；已删除或移出的修订、删除的表格行/单元格、文本框、绘图和嵌入对象不会朗读。对于扩展兼容块，解析器作为最小兼容消费者读取单一 Fallback，不会把多个 Choice 重复输出。`.doc` 支持 Word 97–2003 二进制格式，从 OLE 复合文件的 `WordDocument` 与活动 Table 流恢复主文档字符，支持 UTF-16LE 和压缩的 Windows-1252 文字，并隐藏域指令、保留域结果。两种格式都只提取主文档正文，不执行宏，不读取外部资源，也不依赖系统文档转换程序。
+
+当前 `.doc` 是基础正文支持，不解析 CHPX/PAPX 格式属性。因此，由字符属性标记的删除修订仍可能被朗读；二进制表格中的单元格标记会转换为停顿，但不能可靠区分单元格结束与表格行结束。需要严格遵循修订状态或表格行结构时，应优先使用 `.docx`。
+
+Word 文件上限为 64 MiB；DOCX 包的总声明解压大小上限为 256 MiB，主文档 XML 和最终朗读文本分别不超过 16 MiB；DOC 还限制 OLE 目录为 4096 项、目录遍历深度为 128 层，并限制容器初始化期间的元数据读取。加密或密码保护的 Word 文件、Word 97 以前的旧 `.doc`、`.docm`、损坏的容器及超限内容会在 TTS 初始化前返回错误。页眉、页脚、脚注、尾注、批注、图片、嵌入对象和 OCR 不在当前提取范围内。
+
+远程输入仅支持绝对 `http://` 和 `https://` HTML 页面，不会把远程 Word 文件当作文档下载。程序会在本机下载网页 HTML，跟随标准 HTTP 重定向，按响应头或 HTML 元数据声明的字符集转换为 UTF-8，并使用 readability.go 提取标题和正文；请求超时为 15 秒，解压后的响应正文上限为 10 MiB，只接受 `text/html`、`application/xhtml+xml` 或未声明 `Content-Type` 的响应。HTTP 错误、不支持的内容类型、超限响应和无法提取正文的页面会在 TTS 初始化前返回错误。PDF 解析尚未包含在当前版本中。
 
 可定位音频播放当前只实现了 macOS。其他操作系统可以编译项目，但运行时会返回明确的不支持提示。临时 AIFF 或 MP3 音频存放在操作系统临时目录中，无论播放成功、失败还是被取消都会清理。每次 Edge TTS 网络调用最多等待 45 秒，并会随播放取消而终止。
 

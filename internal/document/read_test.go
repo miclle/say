@@ -218,6 +218,65 @@ func TestReadSourceReportsMarkdownStages(t *testing.T) {
 	}
 }
 
+func TestReadSourceReportsWordDocumentStages(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     func(*testing.T) string
+		wantName string
+		wantText string
+	}{
+		{
+			name: "DOCX extension is case insensitive",
+			path: func(t *testing.T) string {
+				return writeDOCXFixture(t, "Guide.DOCX", map[string]string{
+					"word/document.xml": `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>DOCX text</w:t></w:r></w:p></w:body></w:document>`,
+				})
+			},
+			wantName: "Guide.DOCX",
+			wantText: "DOCX text",
+		},
+		{
+			name: "DOC extension is case insensitive",
+			path: func(t *testing.T) string {
+				return writeDOCFixture(t, "Legacy.DOC", docFixtureOptions{text: "Legacy text\r"})
+			},
+			wantName: "Legacy.DOC",
+			wantText: "Legacy text",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stages []Stage
+			name, text, err := ReadSourceWithProgress(context.Background(), tt.path(t), func(stage Stage) {
+				stages = append(stages, stage)
+			})
+			if err != nil {
+				t.Fatalf("ReadSourceWithProgress() error = %v", err)
+			}
+			if name != tt.wantName || text != tt.wantText {
+				t.Fatalf("ReadSourceWithProgress() = %q, %q; want %q, %q", name, text, tt.wantName, tt.wantText)
+			}
+			if want := []Stage{StageReadingDocument, StageParsingDocument}; !slices.Equal(stages, want) {
+				t.Fatalf("stages = %#v, want %#v", stages, want)
+			}
+		})
+	}
+}
+
+func TestReadSourceWordDocumentHonorsCanceledContext(t *testing.T) {
+	path := writeDOCXFixture(t, "canceled.docx", map[string]string{
+		"word/document.xml": `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>text</w:t></w:r></w:p></w:body></w:document>`,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := ReadSource(ctx, path)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadSource() error = %v, want context.Canceled", err)
+	}
+}
+
 func TestReadSourceReportsWebStages(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")

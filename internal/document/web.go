@@ -43,7 +43,7 @@ func ReadSourceWithProgress(ctx context.Context, source string, progress Progres
 	if parseErr == nil && parsed.Scheme != "" && strings.Contains(source, "://") {
 		return "", "", fmt.Errorf("open web page %q: unsupported URL scheme %q", parsed.Redacted(), parsed.Scheme)
 	}
-	return readLocal(source, progress)
+	return readLocal(ctx, source, progress)
 }
 
 func readWeb(ctx context.Context, source string, client httpDoer, progress ProgressFunc) (name string, text string, err error) {
