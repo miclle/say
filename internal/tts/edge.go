@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -25,6 +26,7 @@ const (
 	edgeChromiumVersion    = "143.0.3650.75"
 	edgeDefaultVoice       = "zh-CN-XiaoxiaoNeural"
 	edgeDefaultTimeout     = 45 * time.Second
+	edgeMaxAttempts        = 2
 	edgeWindowsEpoch       = int64(11644473600)
 	edgeTicksPerSecond     = int64(10000000)
 )
@@ -98,11 +100,19 @@ func (s *edgeSynthesizer) Synthesize(ctx context.Context, text, outputPath strin
 	if strings.TrimSpace(outputPath) == "" {
 		return fmt.Errorf("output path is empty")
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
-	audio, err := s.synthesize(requestCtx, edgeRequest{Text: text, Voice: s.voice, Speed: s.speed})
-	if err != nil {
-		return fmt.Errorf("Edge TTS synthesis failed: %w", err)
+	request := edgeRequest{Text: text, Voice: s.voice, Speed: s.speed}
+	var audio []byte
+	for attempt := 0; attempt < edgeMaxAttempts; attempt++ {
+		requestCtx, cancel := context.WithTimeout(ctx, s.timeout)
+		var err error
+		audio, err = s.synthesize(requestCtx, request)
+		cancel()
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded) || attempt == edgeMaxAttempts-1 {
+			return fmt.Errorf("Edge TTS synthesis failed: %w", err)
+		}
 	}
 	if len(audio) == 0 {
 		return fmt.Errorf("Edge TTS returned no audio")

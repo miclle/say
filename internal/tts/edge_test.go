@@ -131,6 +131,29 @@ func TestEdgeSynthesizerHonorsRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestEdgeSynthesizerRetriesOneInternalRequestTimeout(t *testing.T) {
+	attempts := 0
+	synthesizer := newEdgeSynthesizer("voice", 1, 10*time.Millisecond, func(ctx context.Context, _ edgeRequest) ([]byte, error) {
+		attempts++
+		if attempts == 1 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return []byte("mp3"), nil
+	})
+	outputPath := filepath.Join(t.TempDir(), "speech.mp3")
+
+	if err := synthesizer.Synthesize(context.Background(), "hello", outputPath); err != nil {
+		t.Fatalf("Synthesize() error = %v, want retry success", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if audio, err := os.ReadFile(outputPath); err != nil || string(audio) != "mp3" {
+		t.Fatalf("output audio = %q, %v; want %q", audio, err, "mp3")
+	}
+}
+
 func TestEdgeGECTokenUsesFiveMinuteWindows(t *testing.T) {
 	now := time.Date(2026, time.August, 18, 0, 0, 42, 0, time.UTC)
 	if got, want := edgeGECToken(now), "239B9D28F00427DEA5116F1C61BD26DA1472A0B3731D97AAD23867CFCBDDDE06"; got != want {
