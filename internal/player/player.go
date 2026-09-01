@@ -29,6 +29,10 @@ const (
 	PreviousChapter
 	// NextChapter selects the start of the next chapter.
 	NextChapter
+	// ResumePlayback starts playback unless it is already playing.
+	ResumePlayback
+	// PausePlayback pauses playback unless it is already paused.
+	PausePlayback
 )
 
 // SentenceTrack binds a source sentence to its synthesized audio.
@@ -61,6 +65,12 @@ type View interface {
 	Seeked(index, total int, text string, sentence int, playing bool, delta, position, duration time.Duration, complete bool) error
 	Failed(index, total int, err error) error
 	Finish(total int) error
+}
+
+// TrackView receives precise audio metadata after a sentence is activated.
+// Views that do not publish system media metadata do not need to implement it.
+type TrackView interface {
+	Track(index, total, sentence int, text string, playing bool, position, duration time.Duration) error
 }
 
 type streamPlayer struct {
@@ -256,6 +266,11 @@ func (p *streamPlayer) activate() error {
 	if err := p.transport.Load(audio.Path); err != nil {
 		return fmt.Errorf("load chapter %d sentence %d: %w", index+1, p.target.Sentence+1, err)
 	}
+	if details, ok := p.view.(TrackView); ok {
+		if err := details.Track(index, total, p.target.Sentence, p.texts[index][p.target.Sentence], p.playing, 0, audio.Duration); err != nil {
+			return err
+		}
+	}
 	p.loaded, p.hasLoaded, p.active, p.awaiting, p.navigating = p.target, true, true, false, false
 	if p.playing {
 		if err := p.transport.Play(); err != nil {
@@ -265,6 +280,29 @@ func (p *streamPlayer) activate() error {
 		return err
 	}
 	return nil
+}
+
+func (p *streamPlayer) publishTrack() error {
+	if !p.active || !p.hasLoaded {
+		return nil
+	}
+	details, ok := p.view.(TrackView)
+	if !ok {
+		return nil
+	}
+	audio, ok := p.cache[p.loaded]
+	if !ok {
+		return nil
+	}
+	return details.Track(
+		p.loaded.Chapter,
+		len(p.chapters),
+		p.loaded.Sentence,
+		p.texts[p.loaded.Chapter][p.loaded.Sentence],
+		p.playing,
+		p.transport.Position(),
+		audio.Duration,
+	)
 }
 
 func (p *streamPlayer) tick() (bool, error) {

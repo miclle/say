@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/miclle/say/internal/audio"
@@ -34,6 +35,14 @@ type audioTransport interface {
 	Close() error
 }
 
+// PlaybackControls is an optional non-terminal playback surface.
+type PlaybackControls interface {
+	player.View
+	Configure(title string, chapters []string) error
+	Commands() <-chan player.Command
+	Close() error
+}
+
 type dependencies struct {
 	input            io.Reader
 	readDocument     documentReader
@@ -43,11 +52,21 @@ type dependencies struct {
 	supportsTerminal terminalDetector
 	beginRaw         rawInputFactory
 	selectProvider   providerSelector
+	controls         PlaybackControls
 }
 
 // Run executes the say command and returns a process exit code.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	return runWithDependencies(ctx, args, stdout, stderr, dependencies{
+	return runWithDependencies(ctx, args, stdout, stderr, defaultDependencies(nil))
+}
+
+// RunWithControls executes say with a desktop playback surface.
+func RunWithControls(ctx context.Context, args []string, stdout, stderr io.Writer, controls PlaybackControls) int {
+	return runWithDependencies(ctx, args, stdout, stderr, defaultDependencies(controls))
+}
+
+func defaultDependencies(controls PlaybackControls) dependencies {
+	return dependencies{
 		input:          os.Stdin,
 		readDocument:   document.ReadSourceWithProgress,
 		newSynthesizer: tts.New,
@@ -64,7 +83,79 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return terminal.BeginRawInput(file)
 		},
 		selectProvider: selectTTSProvider,
-	})
+		controls:       controls,
+	}
+}
+
+type commandFlags struct {
+	provider  *string
+	voice     *string
+	rate      *int
+	speed     *float64
+	maxChars  *int
+	noColor   *bool
+	noMenuBar *bool
+}
+
+func registerCommandFlags(flags *flag.FlagSet) commandFlags {
+	return commandFlags{
+		provider:  flags.String("provider", "", "TTS provider: system or edge (interactive: choose; non-interactive: system)"),
+		voice:     flags.String("voice", "", "provider voice name (default: provider voice)"),
+		rate:      flags.Int("rate", 0, "system speech rate in words per minute (default: system rate)"),
+		speed:     flags.Float64("speed", 1, "Edge TTS speed multiplier, from 0.5 to 2.0"),
+		maxChars:  flags.Int("max-chars", defaultMaxChars, "maximum Unicode characters per TTS call"),
+		noColor:   flags.Bool("no-color", false, "disable ANSI terminal colors"),
+		noMenuBar: flags.Bool("no-menu-bar", false, "disable macOS menu bar and system media controls"),
+	}
+}
+
+func (options commandFlags) basicError() error {
+	if *options.maxChars <= 0 {
+		return fmt.Errorf("max-chars must be greater than zero")
+	}
+	if *options.rate < 0 {
+		return fmt.Errorf("rate must not be negative")
+	}
+	return nil
+}
+
+func explicitFlags(flags *flag.FlagSet) map[string]bool {
+	explicit := make(map[string]bool)
+	flags.Visit(func(flag *flag.Flag) { explicit[flag.Name] = true })
+	return explicit
+}
+
+// WantsMenuBar reports whether args describe a playback invocation that has
+// not explicitly disabled the desktop surface.
+func WantsMenuBar(args []string) bool {
+	interactive := isCharacterDevice(os.Stdin) && isCharacterDevice(os.Stdout)
+	return wantsMenuBar(args, interactive)
+}
+
+func wantsMenuBar(args []string, interactive bool) bool {
+	flags := flag.NewFlagSet("say", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	options := registerCommandFlags(flags)
+	if err := flags.Parse(args); err != nil || *options.noMenuBar || flags.NArg() != 1 || options.basicError() != nil {
+		return false
+	}
+	explicit := explicitFlags(flags)
+	if explicit["provider"] {
+		if err := validateProviderFlags(tts.Provider(*options.provider), *options.rate, *options.speed, explicit); err != nil {
+			return false
+		}
+	} else if !interactive {
+		if err := validateProviderFlags(tts.ProviderSystem, *options.rate, *options.speed, explicit); err != nil {
+			return false
+		}
+	} else if explicit["rate"] && explicit["speed"] {
+		return false
+	} else if explicit["speed"] {
+		if err := validateProviderFlags(tts.ProviderEdge, *options.rate, *options.speed, explicit); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.Writer, deps dependencies) int {
@@ -75,12 +166,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 
 	flags := flag.NewFlagSet("say", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	provider := flags.String("provider", "", "TTS provider: system or edge (interactive: choose; non-interactive: system)")
-	voice := flags.String("voice", "", "provider voice name (default: provider voice)")
-	rate := flags.Int("rate", 0, "system speech rate in words per minute (default: system rate)")
-	speed := flags.Float64("speed", 1, "Edge TTS speed multiplier, from 0.5 to 2.0")
-	maxChars := flags.Int("max-chars", defaultMaxChars, "maximum Unicode characters per TTS call")
-	noColor := flags.Bool("no-color", false, "disable ANSI terminal colors")
+	options := registerCommandFlags(flags)
 	flags.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: say [flags] <document-or-url>")
 		fmt.Fprintln(stderr)
@@ -96,16 +182,9 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		}
 		return 2
 	}
-	explicit := make(map[string]bool)
-	flags.Visit(func(flag *flag.Flag) {
-		explicit[flag.Name] = true
-	})
-	if *maxChars <= 0 {
-		fmt.Fprintln(stderr, "say: max-chars must be greater than zero")
-		return 2
-	}
-	if *rate < 0 {
-		fmt.Fprintln(stderr, "say: rate must not be negative")
+	explicit := explicitFlags(flags)
+	if err := options.basicError(); err != nil {
+		fmt.Fprintf(stderr, "say: %v\n", err)
 		return 2
 	}
 	if flags.NArg() != 1 {
@@ -117,16 +196,16 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	interactive := deps.supportsTerminal(deps.input) && terminalOutput
 	selectedProvider := tts.ProviderSystem
 	if explicit["provider"] {
-		selectedProvider = tts.Provider(*provider)
+		selectedProvider = tts.Provider(*options.provider)
 	}
 	if explicit["provider"] || !interactive {
-		if err := validateProviderFlags(selectedProvider, *rate, *speed, explicit); err != nil {
+		if err := validateProviderFlags(selectedProvider, *options.rate, *options.speed, explicit); err != nil {
 			fmt.Fprintf(stderr, "say: %v\n", err)
 			return 2
 		}
 	}
 
-	title, text, err := readDocumentWithLoading(ctx, flags.Arg(0), stdout, !*noColor && terminalOutput, terminalOutput, deps.readDocument)
+	title, text, err := readDocumentWithLoading(ctx, flags.Arg(0), stdout, !*options.noColor && terminalOutput, terminalOutput, deps.readDocument)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 			fmt.Fprintf(stderr, "say: source loading interrupted: %v\n", err)
@@ -135,7 +214,7 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		fmt.Fprintf(stderr, "say: %v\n", err)
 		return 1
 	}
-	chunks, err := textchunk.Split(text, *maxChars)
+	chunks, err := textchunk.Split(text, *options.maxChars)
 	if err != nil {
 		fmt.Fprintf(stderr, "say: split document: %v\n", err)
 		return 1
@@ -160,29 +239,38 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 			fmt.Fprintf(stderr, "say: select TTS provider: %v\n", err)
 			return 1
 		}
-		if err := validateProviderFlags(selectedProvider, *rate, *speed, explicit); err != nil {
+		if err := validateProviderFlags(selectedProvider, *options.rate, *options.speed, explicit); err != nil {
 			fmt.Fprintf(stderr, "say: %v\n", err)
 			return 2
 		}
 	}
-	options := tts.Options{Provider: selectedProvider, Voice: *voice}
+	ttsOptions := tts.Options{Provider: selectedProvider, Voice: *options.voice}
 	if selectedProvider == tts.ProviderSystem {
-		options.Rate = *rate
+		ttsOptions.Rate = *options.rate
 	} else {
-		options.Speed = *speed
+		ttsOptions.Speed = *options.speed
 	}
-	synthesizer, err := deps.newSynthesizer(options)
+	synthesizer, err := deps.newSynthesizer(ttsOptions)
 	if err != nil {
 		fmt.Fprintf(stderr, "say: initialize TTS: %v\n", err)
 		return 1
 	}
 
-	view := terminal.New(stdout, !*noColor && terminalOutput, title, synthesizer.Name())
-	view.SetChapters(chunks)
-	view.SetControls(interactive)
-	if err := view.Preparing(len(chunks)); err != nil {
+	terminalView := terminal.New(stdout, !*options.noColor && terminalOutput, title, synthesizer.Name())
+	terminalView.SetChapters(chunks)
+	terminalView.SetControls(interactive)
+	if err := terminalView.Preparing(len(chunks)); err != nil {
 		fmt.Fprintf(stderr, "say: render preparation: %v\n", err)
 		return 1
+	}
+	var view player.View = terminalView
+	if deps.controls != nil {
+		if err := deps.controls.Configure(title, chunks); err != nil {
+			fmt.Fprintf(stderr, "say: initialize desktop controls: %v\n", err)
+			return 1
+		}
+		defer deps.controls.Close()
+		view = player.CombineViews(terminalView, deps.controls)
 	}
 
 	tempDir, err := os.MkdirTemp("", "say-audio-*")
@@ -199,19 +287,22 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 	}
 	defer transport.Close()
 
-	var commands <-chan player.Command
+	var commandSources []<-chan player.Command
 	restore := func() error { return nil }
-	var cancelCommands context.CancelFunc = func() {}
+	commandCtx, cancelCommands := context.WithCancel(ctx)
+	defer cancelCommands()
 	if interactive {
 		restore, err = deps.beginRaw(deps.input)
 		if err != nil {
 			fmt.Fprintf(stderr, "say: enable playback controls: %v\n", err)
 			return 1
 		}
-		commandCtx, cancel := context.WithCancel(ctx)
-		cancelCommands = cancel
-		commands = terminal.ReadCommands(commandCtx, deps.input)
+		commandSources = append(commandSources, terminal.ReadCommands(commandCtx, deps.input))
 	}
+	if deps.controls != nil {
+		commandSources = append(commandSources, deps.controls.Commands())
+	}
+	commands := mergeCommands(commandCtx, commandSources...)
 
 	preparation := prepareAudio(ctx, chunks, tempDir, synthesizer, deps.readDuration)
 	playbackErr := player.Play(ctx, chunks, preparation, transport, commands, view)
@@ -231,6 +322,43 @@ func runWithDependencies(ctx context.Context, args []string, stdout, stderr io.W
 		return 1
 	}
 	return 0
+}
+
+func mergeCommands(ctx context.Context, sources ...<-chan player.Command) <-chan player.Command {
+	if len(sources) == 0 {
+		return nil
+	}
+	commands := make(chan player.Command, 32)
+	var workers sync.WaitGroup
+	for _, source := range sources {
+		if source == nil {
+			continue
+		}
+		workers.Add(1)
+		go func(source <-chan player.Command) {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case command, ok := <-source:
+					if !ok {
+						return
+					}
+					select {
+					case commands <- command:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}(source)
+	}
+	go func() {
+		workers.Wait()
+		close(commands)
+	}()
+	return commands
 }
 
 type documentResult struct {

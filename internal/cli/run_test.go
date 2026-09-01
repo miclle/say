@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -715,6 +716,136 @@ func TestRunHelpDescribesInteractiveProviderSelection(t *testing.T) {
 	}
 }
 
+func TestWantsMenuBarOnlyForPlaybackInvocations(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "document", args: []string{"notes.txt"}, want: true},
+		{name: "flags and document", args: []string{"--provider", "system", "notes.txt"}, want: true},
+		{name: "equals flag and document", args: []string{"--provider=system", "notes.txt"}, want: true},
+		{name: "boolean flag and document", args: []string{"--no-color", "notes.txt"}, want: true},
+		{name: "disabled", args: []string{"--no-menu-bar", "notes.txt"}},
+		{name: "disabled explicit true", args: []string{"--no-menu-bar=true", "notes.txt"}},
+		{name: "enabled explicit false", args: []string{"--no-menu-bar=false", "notes.txt"}, want: true},
+		{name: "short help", args: []string{"-h"}},
+		{name: "long help", args: []string{"--help"}},
+		{name: "missing document"},
+		{name: "unknown flag", args: []string{"--unknown", "notes.txt"}},
+		{name: "extra document", args: []string{"one.txt", "two.txt"}},
+		{name: "flag after document", args: []string{"notes.txt", "--no-color"}},
+		{name: "invalid number", args: []string{"--rate", "fast", "notes.txt"}},
+		{name: "invalid maximum", args: []string{"--max-chars", "0", "notes.txt"}},
+		{name: "invalid provider combination", args: []string{"--provider", "edge", "--rate", "200", "notes.txt"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := WantsMenuBar(test.args); got != test.want {
+				t.Fatalf("WantsMenuBar(%q)=%t want=%t", test.args, got, test.want)
+			}
+		})
+	}
+}
+
+func TestWantsMenuBarRejectsImplicitEdgeSpeedWithoutInteractiveProviderSelection(t *testing.T) {
+	const helper = "SAY_TEST_WANTS_MENU_BAR_NON_INTERACTIVE"
+	if os.Getenv(helper) == "1" {
+		if WantsMenuBar([]string{"--speed", "1.25", "notes.txt"}) {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	command := exec.Command(os.Args[0], "-test.run=^TestWantsMenuBarRejectsImplicitEdgeSpeedWithoutInteractiveProviderSelection$")
+	command.Env = append(os.Environ(), helper+"=1")
+	command.Stdin = strings.NewReader("")
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Run(); err != nil {
+		t.Fatalf("non-interactive WantsMenuBar() requested AppKit: %v\n%s", err, output.String())
+	}
+}
+
+func TestWantsMenuBarValidatesFlagsAgainstAvailableProvider(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		args        []string
+		interactive bool
+		want        bool
+	}{
+		{name: "non-interactive speed defaults to system", args: []string{"--speed", "1.25", "notes.txt"}},
+		{name: "interactive speed can select edge", args: []string{"--speed", "1.25", "notes.txt"}, interactive: true, want: true},
+		{name: "interactive invalid edge speed", args: []string{"--speed", "0.49", "notes.txt"}, interactive: true},
+		{name: "interactive rate can select system", args: []string{"--rate", "210", "notes.txt"}, interactive: true, want: true},
+		{name: "no provider accepts rate and speed", args: []string{"--rate", "210", "--speed", "1.25", "notes.txt"}, interactive: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := wantsMenuBar(test.args, test.interactive); got != test.want {
+				t.Fatalf("wantsMenuBar(%q, %t)=%t want=%t", test.args, test.interactive, got, test.want)
+			}
+		})
+	}
+}
+
+func TestMergeCommandsForwardsTerminalAndDesktopInput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	terminalCommands := make(chan player.Command, 1)
+	desktopCommands := make(chan player.Command, 1)
+	commands := mergeCommands(ctx, terminalCommands, desktopCommands)
+
+	terminalCommands <- player.Backward
+	desktopCommands <- player.Forward
+	seen := map[player.Command]bool{}
+	for range 2 {
+		select {
+		case command := <-commands:
+			seen[command] = true
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for merged command")
+		}
+	}
+	if !seen[player.Backward] || !seen[player.Forward] {
+		t.Fatalf("merged commands=%v", seen)
+	}
+
+	cancel()
+	select {
+	case _, ok := <-commands:
+		if ok {
+			t.Fatal("merged command stream remained open after cancellation")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("merged command stream did not close")
+	}
+}
+
+func TestRunConfiguresAndClosesDesktopControls(t *testing.T) {
+	path := writeDocument(t, "lesson.txt", "First sentence. Second sentence.")
+	var stdout, stderr bytes.Buffer
+	synthesizer := newFakeSynthesizer()
+	controls := &recordingPlaybackControls{
+		View:     player.CombineViews(),
+		commands: make(chan player.Command),
+	}
+	deps := testDependencies(synthesizer, newFakeAudio(&stdout, synthesizer))
+	deps.controls = controls
+
+	code := runWithDependencies(context.Background(), []string{"--no-color", path}, &stdout, &stderr, deps)
+	if code != 0 {
+		t.Fatalf("runWithDependencies() code = %d, stderr = %q", code, stderr.String())
+	}
+	if controls.title != "lesson.txt" {
+		t.Fatalf("desktop title=%q want lesson.txt", controls.title)
+	}
+	if got, want := controls.chapters, []string{"First sentence. Second sentence."}; !slices.Equal(got, want) {
+		t.Fatalf("desktop chapters=%q want=%q", got, want)
+	}
+	if controls.closeCalls != 1 {
+		t.Fatalf("desktop close calls=%d want=1", controls.closeCalls)
+	}
+}
+
 func TestRunReturns130WhenAlreadyCanceled(t *testing.T) {
 	path := writeDocument(t, "lesson.txt", "hello.")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -746,6 +877,29 @@ func testDependencies(synthesizer *fakeSynthesizer, transport *fakeAudio) depend
 			return nil, fmt.Errorf("must not enable raw input")
 		},
 	}
+}
+
+type recordingPlaybackControls struct {
+	player.View
+	title      string
+	chapters   []string
+	commands   chan player.Command
+	closeCalls int
+}
+
+func (controls *recordingPlaybackControls) Configure(title string, chapters []string) error {
+	controls.title = title
+	controls.chapters = append([]string(nil), chapters...)
+	return nil
+}
+
+func (controls *recordingPlaybackControls) Commands() <-chan player.Command {
+	return controls.commands
+}
+
+func (controls *recordingPlaybackControls) Close() error {
+	controls.closeCalls++
+	return nil
 }
 
 type fakeSynthesizer struct {

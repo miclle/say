@@ -115,6 +115,41 @@ func TestNavigationSpaceDuringDebounceDoesNotResumeOldAudio(t *testing.T) {
 	})
 }
 
+func TestNavigationRemotePlaybackCommandsAreIdempotent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newDemandHarness(t, []string{"One."})
+		h.ready(Target{}, "one.aiff")
+
+		h.command(ResumePlayback)
+		h.command(ResumePlayback)
+		h.assertPath("one.aiff", true)
+		h.assertCount("play:one.aiff", 1)
+
+		h.command(PausePlayback)
+		h.command(PausePlayback)
+		h.assertPath("one.aiff", false)
+		h.assertCount("paused:0", 1)
+
+		h.command(ResumePlayback)
+		h.command(ResumePlayback)
+		h.assertPath("one.aiff", true)
+		h.assertCount("resumed:0", 1)
+	})
+}
+
+func TestNavigationRemotePlaybackIntentUpdatesViewDuringSelection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newDemandHarness(t, []string{"One.", "Two."})
+		h.ready(Target{}, "one.aiff")
+		h.command(NextChapter)
+
+		h.command(PausePlayback)
+		h.assertCount("paused:1", 1)
+		h.command(ResumePlayback)
+		h.assertCount("resumed:1", 1)
+	})
+}
+
 func TestNavigationQueuedArrowsSelectOnlyFinalAudio(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newDemandHarness(t, []string{"One.", "Two.", "Three."})

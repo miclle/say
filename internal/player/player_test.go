@@ -98,6 +98,54 @@ func TestPlayStartsWithFirstSentenceWhileLaterAudioIsMissing(t *testing.T) {
 	})
 }
 
+func TestPlayPublishesLoadedSentenceDurationToDetailedView(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := newFakeTransport(nil)
+		source := &demandSource{results: make(chan AudioResult, 1), events: &transport.events}
+		commands := make(chan Command, 1)
+		view := &trackRecordingView{recordingView: recordingView{events: &transport.events}}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- Play(ctx, []string{"First."}, source, transport, commands, view)
+		}()
+		synctest.Wait()
+		source.results <- AudioResult{Target: Target{}, Audio: SentenceTrack{Path: "first.aiff", Duration: 3 * time.Second}}
+		synctest.Wait()
+		if got := transport.countEvent("track:0:0:0s:3s:true"); got != 1 {
+			t.Fatalf("track detail count=%d events=%v", got, transport.snapshot())
+		}
+	})
+}
+
+func TestPlayPublishesCurrentPositionWhenPlaybackStateChanges(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		transport := newFakeTransport(nil)
+		source := &demandSource{results: make(chan AudioResult, 1), events: &transport.events}
+		commands := make(chan Command, 2)
+		view := &trackRecordingView{recordingView: recordingView{events: &transport.events}}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() { _ = Play(ctx, []string{"First."}, source, transport, commands, view) }()
+		synctest.Wait()
+		source.results <- AudioResult{Target: Target{}, Audio: SentenceTrack{Path: "first.aiff", Duration: 3 * time.Second}}
+		synctest.Wait()
+		transport.setPosition(1200 * time.Millisecond)
+
+		commands <- PausePlayback
+		synctest.Wait()
+		if got := transport.countEvent("track:0:0:1.2s:3s:false"); got != 1 {
+			t.Fatalf("paused track detail count=%d events=%v", got, transport.snapshot())
+		}
+		commands <- ResumePlayback
+		synctest.Wait()
+		if got := transport.countEvent("track:0:0:1.2s:3s:true"); got != 1 {
+			t.Fatalf("resumed track detail count=%d events=%v", got, transport.snapshot())
+		}
+	})
+}
+
 func TestPlayAdvancesOnlyAfterActualAudioEnds(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newDemandHarness(t, []string{"First. Second."})
@@ -324,6 +372,13 @@ func (l *eventLog) waitFor(t *testing.T, event string) {
 }
 
 type recordingView struct{ events *eventLog }
+
+type trackRecordingView struct{ recordingView }
+
+func (view *trackRecordingView) Track(index, _ int, sentence int, _ string, playing bool, position, duration time.Duration) error {
+	view.events.add(fmt.Sprintf("track:%d:%d:%s:%s:%t", index, sentence, position, duration, playing))
+	return nil
+}
 
 func (v *recordingView) Prepared(prepared, total int) error {
 	v.events.add(fmt.Sprintf("prepared:%d:%d", prepared, total))

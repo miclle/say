@@ -1,8 +1,23 @@
 package player
 
 func (p *streamPlayer) handleCommand(command Command) (bool, error) {
-	if command == Toggle {
-		p.playing = !p.playing
+	if command == Toggle || command == ResumePlayback || command == PausePlayback {
+		playing := p.playing
+		switch command {
+		case Toggle:
+			playing = !playing
+		case ResumePlayback:
+			if playing {
+				return false, nil
+			}
+			playing = true
+		case PausePlayback:
+			if !playing {
+				return false, nil
+			}
+			playing = false
+		}
+		p.playing = playing
 		if p.active {
 			if p.playing {
 				if err := p.transport.Play(); err != nil {
@@ -16,12 +31,24 @@ func (p *streamPlayer) handleCommand(command Command) (bool, error) {
 			return false, nil
 		}
 		if p.selecting {
-			return false, p.view.Selected(p.target.Chapter, len(p.chapters), p.chapters[p.target.Chapter], p.target.Sentence)
+			if err := p.view.Selected(p.target.Chapter, len(p.chapters), p.chapters[p.target.Chapter], p.target.Sentence); err != nil {
+				return false, err
+			}
+			if p.playing {
+				return false, p.view.Resumed(p.target.Chapter, len(p.chapters))
+			}
+			return false, p.view.Paused(p.target.Chapter, len(p.chapters))
 		}
+		var err error
 		if p.playing {
-			return false, p.view.Resumed(p.target.Chapter, len(p.chapters))
+			err = p.view.Resumed(p.target.Chapter, len(p.chapters))
+		} else {
+			err = p.view.Paused(p.target.Chapter, len(p.chapters))
 		}
-		return false, p.view.Paused(p.target.Chapter, len(p.chapters))
+		if err != nil {
+			return false, err
+		}
+		return false, p.publishTrack()
 	}
 	target := p.target
 	switch command {
